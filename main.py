@@ -2095,6 +2095,254 @@ def manus_session_label(user_id: int) -> str:
     return f"`{str(sess.get('task_id'))[:10]}…`"
 
 
+# ---------------------------------------------------------------------------
+# Bot mode: exclusive chat (Dahl) vs manus
+# ---------------------------------------------------------------------------
+
+BOT_MODE_CHAT = "chat"
+BOT_MODE_MANUS = "manus"
+_USER_MODES: Dict[int, str] = {}
+# user_id -> {name, prompt} selected for next Manus photo
+_SAVED_PROMPT_PICK: Dict[int, dict] = {}
+# Fallback if user_prompts table missing
+_PROMPT_CACHE: Dict[int, Dict[str, str]] = {}
+
+
+def get_bot_mode(user_id: int) -> str:
+    mode = _USER_MODES.get(user_id)
+    if mode in (BOT_MODE_CHAT, BOT_MODE_MANUS):
+        return mode
+    try:
+        res = sb_get(f"users?telegram_id=eq.{user_id}&select=bot_mode")
+        data = res.json() or []
+        if data:
+            m = (data[0].get("bot_mode") or "").strip().lower()
+            if m in (BOT_MODE_CHAT, BOT_MODE_MANUS):
+                _USER_MODES[user_id] = m
+                return m
+    except Exception:
+        pass
+    return BOT_MODE_CHAT
+
+
+def set_bot_mode(user_id: int, mode: str) -> bool:
+    if mode not in (BOT_MODE_CHAT, BOT_MODE_MANUS):
+        return False
+    _USER_MODES[user_id] = mode
+    try:
+        return set_user_settings(user_id, bot_mode=mode)
+    except Exception as e:
+        logging.warning(f"set_bot_mode persist: {e}")
+        return True  # memory at least
+
+
+def mode_fa(mode: str) -> str:
+    return "💬 چت با دال" if mode == BOT_MODE_CHAT else "🎨 Manus"
+
+
+# ---------------------------------------------------------------------------
+# Saved prompts (long prompt + photo workaround)
+# ---------------------------------------------------------------------------
+
+def _prompt_cache_load(user_id: int) -> Dict[str, str]:
+    if user_id not in _PROMPT_CACHE:
+        _PROMPT_CACHE[user_id] = {}
+    return _PROMPT_CACHE[user_id]
+
+
+def list_user_prompts(user_id: int) -> List[dict]:
+    rows: List[dict] = []
+    try:
+        res = sb_get(
+            f"user_prompts?user_id=eq.{user_id}&order=updated_at.desc&select=id,name,prompt,updated_at&limit=50"
+        )
+        if res.status_code >= 400:
+            cache = _prompt_cache_load(user_id)
+            return [
+                {"name": n, "prompt": p, "id": None, "updated_at": ""}
+                for n, p in cache.items()
+            ]
+        data = res.json() or []
+        if isinstance(data, list):
+            rows = data
+            cache = _prompt_cache_load(user_id)
+            cache.clear()
+            for r in rows:
+                cache[r.get("name") or ""] = r.get("prompt") or ""
+    except Exception as e:
+        logging.error(f"list_user_prompts: {e}")
+        cache = _prompt_cache_load(user_id)
+        return [
+            {"name": n, "prompt": p, "id": None, "updated_at": ""}
+            for n, p in cache.items()
+        ]
+    return rows
+
+
+def save_user_prompt(user_id: int, name: str, prompt: str) -> bool:
+    name = (name or "").strip()[:64]
+    prompt = (prompt or "").strip()
+    if not name or not prompt:
+        return False
+    _prompt_cache_load(user_id)[name] = prompt
+    payload = {
+        "user_id": user_id,
+        "name": name,
+        "prompt": prompt[:8000],
+        "updated_at": utcnow_iso(),
+        "created_at": utcnow_iso(),
+    }
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/user_prompts?on_conflict=user_id,name"
+        headers = supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+        with httpx.Client(timeout=10.0) as client:
+            res = client.post(url, headers=headers, json=payload)
+            if res.status_code >= 400:
+                logging.error(f"save_user_prompt {res.status_code}: {res.text[:200]}")
+                return False
+        return True
+    except Exception as e:
+        logging.error(f"save_user_prompt: {e}")
+        return True  # cache-only fallback
+
+
+def delete_user_prompt(user_id: int, name: str) -> bool:
+    name = (name or "").strip()
+    _prompt_cache_load(user_id).pop(name, None)
+    if _SAVED_PROMPT_PICK.get(user_id, {}).get("name") == name:
+        _SAVED_PROMPT_PICK.pop(user_id, None)
+    try:
+        res = sb_delete(f"user_prompts?user_id=eq.{user_id}&name=eq.{name}")
+        return res.status_code < 400
+    except Exception as e:
+        logging.error(f"delete_user_prompt: {e}")
+        return False
+
+
+def get_saved_prompt(user_id: int, name: str) -> Optional[str]:
+    name = (name or "").strip()
+    cache = _prompt_cache_load(user_id)
+    if name in cache:
+        return cache[name]
+    try:
+        res = sb_get(
+            f"user_prompts?user_id=eq.{user_id}&name=eq.{name}&select=prompt"
+        )
+        data = res.json() or []
+        if data:
+            p = data[0].get("prompt") or ""
+            cache[name] = p
+            return p
+    except Exception as e:
+        logging.error(f"get_saved_prompt: {e}")
+    return None
+
+
+def get_picked_prompt(user_id: int) -> Optional[dict]:
+    pick = _SAVED_PROMPT_PICK.get(user_id)
+    if not pick:
+        return None
+    # refresh from store
+    stored = get_saved_prompt(user_id, pick.get("name") or "")
+    if stored:
+        pick["prompt"] = stored
+    return pick
+
+
+def pick_saved_prompt(user_id: int, name: str) -> Optional[dict]:
+    prompt = get_saved_prompt(user_id, name)
+    if not prompt:
+        return None
+    pick = {"name": name, "prompt": prompt, "picked_at": time.time()}
+    _SAVED_PROMPT_PICK[user_id] = pick
+    return pick
+
+
+def clear_picked_prompt(user_id: int):
+    _SAVED_PROMPT_PICK.pop(user_id, None)
+
+
+def get_main_keyboard(mode: Optional[str] = None) -> InlineKeyboardMarkup:
+    # mode unused for layout; labels stay fixed
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
+    markup.row(InlineKeyboardButton("🎨 Manus (تصویر/تحقیق)", callback_data="mode_manus"))
+    markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
+    markup.row(InlineKeyboardButton("📝 پرامپت‌های من", callback_data="menu_my_prompts"))
+    if PROMPTOPIA_URL:
+        markup.row(InlineKeyboardButton(PROMPTOPIA_LABEL, url=PROMPTOPIA_URL))
+    markup.row(
+        InlineKeyboardButton("🔑 کلیدهای من", callback_data="keys_list"),
+        InlineKeyboardButton("📊 آمار مصرف", callback_data="menu_usage"),
+    )
+    markup.row(InlineKeyboardButton("ℹ️ راهنما", callback_data="menu_help"))
+    return markup
+
+
+def get_manus_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
+    markup.row(InlineKeyboardButton("📝 استفاده از پرامپت سیو شده", callback_data="manus_pick_prompt"))
+    markup.row(InlineKeyboardButton("🖼 مثال: ساخت تصویر", callback_data="manus_example_image"))
+    markup.row(InlineKeyboardButton("📊 وضعیت صف", callback_data="manus_queue"))
+    if user_id is not None:
+        pick = _SAVED_PROMPT_PICK.get(user_id)
+        if pick:
+            markup.row(
+                InlineKeyboardButton(
+                    f"✔️ پرامپت فعال: {(pick.get('name') or '')[:24]}",
+                    callback_data="manus_clear_pick",
+                )
+            )
+    markup.row(InlineKeyboardButton("🔑 کلید Manus", callback_data="keys_provider:manus"))
+    markup.row(InlineKeyboardButton("💳 credits من", callback_data="manus_credits"))
+    markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
+    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
+    return markup
+
+
+def get_my_prompts_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("➕ ثبت پرامپت جدید", callback_data="prompt_save_start"))
+    rows = list_user_prompts(user_id)[:12]
+    for r in rows:
+        name = (r.get("name") or "")[:28]
+        markup.row(InlineKeyboardButton(f"📝 {name}", callback_data=f"prompt_use:{name[:40]}"))
+    for r in rows[:8]:
+        name = (r.get("name") or "")[:28]
+        markup.row(InlineKeyboardButton(f"🗑 {name}", callback_data=f"prompt_del:{name[:40]}"))
+    markup.row(InlineKeyboardButton("🎨 Manus با پرامپت سیو شده", callback_data="manus_pick_prompt"))
+    markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu_my_prompts"))
+    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
+    return markup
+
+
+def my_prompts_text(user_id: int) -> str:
+    rows = list_user_prompts(user_id)
+    pick = _SAVED_PROMPT_PICK.get(user_id)
+    mode = get_bot_mode(user_id)
+    lines = [
+        "📝 **پرامپت‌های من**",
+        "",
+        f"حالت ربات: **{mode_fa(mode)}** (`{mode}`)",
+        f"پرامپت انتخاب‌شده برای Manus: "
+        + (f"**{(pick or {}).get('name')}**" if pick else "—"),
+        "",
+        "چرا؟ تلگرام روی کپشن عکس **طول متن محدود** دارد؛",
+        "پرامپت بلند را ذخیره کن و در Manus فقط **عکس** بفرست.",
+        "",
+    ]
+    if not rows:
+        lines.append("هنوز پرامپتی ذخیره نکرده‌ای. «ثبت پرامپت جدید» را بزن.")
+    else:
+        for r in rows:
+            name = r.get("name") or ""
+            p = (r.get("prompt") or "").replace("\n", " ")
+            lines.append(f"• **{name}** — `{p[:70]}…`")
+    return "\n".join(lines)
+
+
 def manus_send_task_message(
     api_key: str,
     task_id: str,
@@ -2598,24 +2846,6 @@ def _execute_manus_job(job: dict):
 # Keyboards
 # ---------------------------------------------------------------------------
 
-def get_main_keyboard() -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
-    markup.row(InlineKeyboardButton("🎨 Manus Agent (تصویر/تحقیق)", callback_data="menu_manus"))
-    if PROMPTOPIA_URL:
-        markup.row(InlineKeyboardButton(PROMPTOPIA_LABEL, url=PROMPTOPIA_URL))
-    markup.row(
-        InlineKeyboardButton("🤖 مدل فعال", callback_data="menu_models"),
-        InlineKeyboardButton("💬 گفتگوها", callback_data="menu_chats"),
-    )
-    markup.row(
-        InlineKeyboardButton("🔑 کلیدهای من", callback_data="keys_list"),
-        InlineKeyboardButton("📊 آمار مصرف", callback_data="menu_usage"),
-    )
-    markup.row(InlineKeyboardButton("ℹ️ راهنما", callback_data="menu_help"))
-    return markup
-
-
 def get_settings_keyboard(style: str, context_n: Optional[int], model_ref: str, streaming: bool) -> InlineKeyboardMarkup:
     provider, model_id = parse_model_ref(model_ref)
     markup = InlineKeyboardMarkup()
@@ -2755,17 +2985,6 @@ def get_key_provider_detail_keyboard(provider: str, has_key: bool) -> InlineKeyb
     return markup
 
 
-def get_manus_keyboard() -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
-    markup.row(InlineKeyboardButton("🖼 مثال: ساخت تصویر", callback_data="manus_example_image"))
-    markup.row(InlineKeyboardButton("📊 وضعیت صف", callback_data="manus_queue"))
-    markup.row(InlineKeyboardButton("🔑 کلید Manus", callback_data="keys_provider:manus"))
-    markup.row(InlineKeyboardButton("💳 credits من", callback_data="manus_credits"))
-    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
-    return markup
-
-
 def manus_intro_text(user_id: int) -> str:
     keys = list_user_keys(user_id)
     has = "manus" in keys
@@ -2790,8 +3009,8 @@ def manus_intro_text(user_id: int) -> str:
         "**مثال پرامپت تصویر:**\n"
         "`Generate a flat illustration of a robot holding a Telegram logo, pastel colors`\n\n"
         "**ویرایش عکس:**\n"
-        "بعد از «اجرای تسک جدید» → **عکس + کپشن** بفرستید\n"
-        "(کپشن = دستور ویرایش)\n\n"
+        "«استفاده از پرامپت سیو شده» → نام پرامپت → فقط **عکس** بفرستید.\n"
+        "یا «اجرای تسک جدید» → عکس + کپشن.\n\n"
         "**ادامه ادیت در همان گفتگو:**\n"
         "پس از هر نتیجه، عکس/متن بعدی را بفرستید — روی **همین task** می‌رود "
         "(`task.sendMessage`)، نه چت جدید.\n"
@@ -2824,7 +3043,12 @@ def get_chats_keyboard(chats: List[dict], active_id: Optional[str]) -> InlineKey
 # UI texts
 # ---------------------------------------------------------------------------
 
-def settings_overview_text(settings: dict, keys: Dict[str, dict], streaming_flag: bool) -> str:
+def settings_overview_text(
+    settings: dict,
+    keys: Dict[str, dict],
+    streaming_flag: bool,
+    user_id: Optional[int] = None,
+) -> str:
     model_ref = settings.get("selected_model", "")
     provider, model_id = parse_model_ref(model_ref)
     style = settings.get("response_style", "html")
@@ -2834,16 +3058,21 @@ def settings_overview_text(settings: dict, keys: Dict[str, dict], streaming_flag
         ALLOW_SHARED_KEY and provider == LEGACY_PROVIDER and DAHL_API_KEY
     )
     active = settings.get("active_conversation_id")
+    mode = get_bot_mode(user_id) if user_id is not None else BOT_MODE_CHAT
+    pick = _SAVED_PROMPT_PICK.get(user_id) if user_id is not None else None
     lines = [
         "⚙️ **تنظیمات ربات**",
         "",
+        f"🎯 **حالت فعال:** {mode_fa(mode)} (`{mode}`)",
         f"🤖 **مدل ارسال/پاسخ:** `{provider}` / `{model_id}`",
         f"   کلید: `{'دارد' if has_key else 'ندارد'}`",
         f"📝 **فرمت پاسخ:** {style_meta['name_fa']}",
         f"📜 **تاریخچه:** {ctx} پیام",
         f"⚡ **استریم:** `{'روشن' if streaming_flag else 'خاموش'}`",
         f"💬 **گفتگوی فعال:** `{(str(active)[:8] + '…') if active else '—'}`",
+        f"📝 **پرامپت Manus:** `{(pick or {}).get('name') or '—'}`",
         "",
+        "حالت‌ها انحصاری‌اند: یا چت دال، یا Manus.",
         "از دکمه‌ها هر بخش را تغییر دهید.",
     ]
     if not settings.get("columns_ok", True):
@@ -3098,10 +3327,14 @@ def handle_start(message):
         f"⚡ **استریم:** `{'روشن' if STREAMING_ENABLED else 'خاموش'}`\n"
         f"💬 **گفتگو:** `{(str(conv.get('id',''))[:8] + '…')}`\n"
         f"📊 **سهمیه امروز:** `{q['used']:,}` / `{q['limit']:,}`\n"
-        f"🧾 نسخه ربات: `{BOT_VERSION}`\n\n"
-        "مدل، فرمت و گفتگوها از **⚙️ تنظیمات**.\n"
-        "پرامپت آماده می‌خواهی؟ **📚** یا `/prompts` (در مرورگر باز می‌شود)\n"
-        "دستورات: `/settings` `/keys` `/chats` `/manus` `/prompts` `/clear` `/help`"
+        f"🧾 نسخه ربات: `{BOT_VERSION}`\n"
+        f"🎯 **حالت:** {mode_fa(get_bot_mode(user_id))}\n\n"
+        "یکی را انتخاب کن:\n"
+        "• **⚙️ تنظیمات**\n"
+        "• **🎨 Manus** — تصویر/تحقیق + پرامپت سیو شده\n"
+        "• **💬 چت با دال** — فقط چت متنی\n"
+        "• **📝 پرامپت‌های من** — ثبت/استفاده پرامپت بلند\n\n"
+        f"دستورات: `/mode` `/saveprompt` `/myprompts` `/keys` `/manus` `/prompts` `/help`"
         + (" `/admin`" if is_admin(user_id) else "")
     )
     bot.reply_to(message, text, reply_markup=get_main_keyboard())
@@ -3155,7 +3388,7 @@ def handle_settings_cmd(message):
     keys = list_user_keys(user_id)
     bot.reply_to(
         message,
-        settings_overview_text(settings, keys, STREAMING_ENABLED),
+        settings_overview_text(settings, keys, STREAMING_ENABLED, user_id=user_id),
         reply_markup=get_settings_keyboard(
             settings.get("response_style", "html"),
             settings.get("context_messages"),
@@ -3243,6 +3476,77 @@ def handle_admin(message):
             pass
 
 
+@bot.message_handler(commands=["mode"])
+def handle_mode_cmd(message):
+    ensure_user(message.from_user)
+    user_id = message.from_user.id
+    parts = (message.text or "").split()
+    if len(parts) > 1:
+        arg = parts[1].strip().lower()
+        if arg in ("chat", "dahl", "چت"):
+            set_bot_mode(user_id, BOT_MODE_CHAT)
+            bot.reply_to(
+                message,
+                f"🎯 حالت: **{mode_fa(BOT_MODE_CHAT)}**\n"
+                "فقط چت با مدل‌های دال/Groq/… فعال است.\n"
+                "برای تصویر: منو → 🎨 Manus",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        if arg in ("manus", "agent", "تصویر"):
+            set_bot_mode(user_id, BOT_MODE_MANUS)
+            bot.reply_to(
+                message,
+                f"🎯 حالت: **{mode_fa(BOT_MODE_MANUS)}**\n"
+                "فقط Manus (تصویر/agent) فعال است.\n"
+                "برای چت عادی: منو → 💬 چت با دال",
+                reply_markup=get_manus_keyboard(user_id),
+            )
+            return
+    mode = get_bot_mode(user_id)
+    bot.reply_to(
+        message,
+        f"🎯 حالت فعلی: **{mode_fa(mode)}**\n\n"
+        "`/mode chat` — فقط چت دال\n"
+        "`/mode manus` — فقط Manus",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@bot.message_handler(commands=["myprompts", "savedprompts"])
+def handle_my_prompts(message):
+    ensure_user(message.from_user)
+    user_id = message.from_user.id
+    bot.reply_to(
+        message,
+        my_prompts_text(user_id),
+        reply_markup=get_my_prompts_keyboard(user_id),
+    )
+
+
+@bot.message_handler(commands=["saveprompt"])
+def handle_saveprompt_cmd(message):
+    ensure_user(message.from_user)
+    user_id = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        PENDING[user_id] = {"action": "prompt_save_name", "name": parts[1].strip()[:64]}
+        bot.reply_to(
+            message,
+            f"📝 نام: **{parts[1].strip()[:64]}**\n\n"
+            "حالا **متن کامل پرامپت** را بفرستید (هرچقدر طولانی).",
+        )
+        return
+    PENDING[user_id] = {"action": "prompt_save_name"}
+    bot.reply_to(
+        message,
+        "📝 **ثبت پرامپت جدید**\n\n"
+        "مرحله ۱ — **نام کوتاه** پرامپت را بفرستید:\n"
+        "مثال: `edit_product_studio`\n\n"
+        "لغو: `/cancel`",
+    )
+
+
 @bot.message_handler(commands=["manus", "agent"])
 def handle_manus_cmd(message):
     ensure_user(message.from_user)
@@ -3256,7 +3560,7 @@ def handle_manus_cmd(message):
             chat_id=message.chat.id,
         )
         return
-    bot.reply_to(message, manus_intro_text(user_id), reply_markup=get_manus_keyboard())
+    bot.reply_to(message, manus_intro_text(user_id), reply_markup=get_manus_keyboard(user_id))
 
 
 @bot.message_handler(commands=["manusqueue", "queue"])
@@ -3337,6 +3641,56 @@ def handle_manus_debug(message):
     bot.reply_to(message, text, reply_markup=markup)
 
 
+def _dahl_fallback_reply(message, user_id: int, note: str = ""):
+    """When Manus prompt is empty but Dahl key exists, answer via chat model."""
+    ensure_user(message.from_user)
+    settings = get_user_settings(user_id)
+    cred = resolve_inference_credentials(user_id)
+    if not cred:
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
+        markup.row(InlineKeyboardButton("🔑 کلیدها", callback_data="keys_list"))
+        bot.reply_to(
+            message,
+            (note + "\n" if note else "")
+            + "کلید دال/مدل چت هم در دسترس نیست.\n"
+            "حالت را روی **چت با دال** بگذارید یا کلید ثبت کنید.",
+            reply_markup=markup,
+        )
+        return
+    try:
+        model_ref = settings.get("selected_model") or get_user_model(user_id)
+        conv = get_active_conversation(user_id, model_ref)
+        history = get_conversation_history(
+            conv.get("id"), limit=settings.get("context_messages") or HISTORY_LIMIT
+        )
+        user_text = (message.text or "").strip() or "hello"
+        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
+        msgs.extend(history)
+        msgs.append({"role": "user", "content": user_text})
+        result = call_llm(
+            cred["base_url"], cred["api_key"], cred["model_id"], msgs, stream=False
+        )
+        save_message(conv.get("id", ""), "user", user_text,
+                     input_tokens=result.get("prompt_tokens", 0))
+        save_message(conv.get("id", ""), "assistant", result.get("content", ""),
+                     output_tokens=result.get("completion_tokens", 0))
+        quota_add_usage(user_id, result.get("total_tokens", 0))
+        prefix = f"{note}\n\n" if note else ""
+        send_bot_reply(
+            message.chat.id,
+            None,
+            prefix + (result.get("content") or "…"),
+            style=settings.get("response_style", "html"),
+        ) if False else bot.reply_to(
+            message,
+            truncate_message(prefix + (result.get("content") or "…")),
+        )
+    except Exception as e:
+        logging.error(f"dahl fallback: {e}")
+        bot.reply_to(message, f"خطا در چت دال:\n`{str(e)[:200]}`")
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -3349,6 +3703,112 @@ def handle_callbacks(call):
         except Exception:
             pass
 
+    # ----- Bot modes (exclusive) -----
+    if data == "mode_chat":
+        set_bot_mode(user_id, BOT_MODE_CHAT)
+        answer("حالت: چت با دال")
+        bot.edit_message_text(
+            f"🎯 **حالت فعال:** {mode_fa(BOT_MODE_CHAT)}\n\n"
+            "فقط چت با مدل‌های دال/Groq/… کار می‌کند.\n"
+            "برای تصویر/Manus از منوی اصلی 🎨 را بزنید.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    if data == "mode_manus":
+        set_bot_mode(user_id, BOT_MODE_MANUS)
+        answer("حالت: Manus")
+        bot.edit_message_text(
+            manus_intro_text(user_id) + f"\n\n🎯 حالت: **{mode_fa(BOT_MODE_MANUS)}**",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(user_id),
+        )
+        return
+
+    # ----- Saved prompts -----
+    if data == "menu_my_prompts":
+        answer()
+        bot.edit_message_text(
+            my_prompts_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_my_prompts_keyboard(user_id),
+        )
+        return
+
+    if data == "prompt_save_start":
+        PENDING[user_id] = {"action": "prompt_save_name"}
+        answer()
+        bot.send_message(
+            call.message.chat.id,
+            "📝 نام کوتاه پرامپت را بفرستید (مثلاً `product_edit`):",
+        )
+        return
+
+    if data == "manus_pick_prompt":
+        rows = list_user_prompts(user_id)
+        if not rows:
+            PENDING[user_id] = {"action": "prompt_save_name"}
+            answer("اول پرامپت ثبت کنید", True)
+            bot.send_message(
+                call.message.chat.id,
+                "پرامپت سیو شده‌ای ندارید.\nنام پرامپت را بفرستید تا ثبت شود:",
+            )
+            return
+        PENDING[user_id] = {"action": "prompt_pick_name"}
+        answer()
+        names = "\n".join(f"• `{r.get('name')}`" for r in rows[:15])
+        bot.send_message(
+            call.message.chat.id,
+            "📝 **استفاده از پرامپت سیو شده**\n\n"
+            f"پرامپت‌های شما:\n{names}\n\n"
+            "نام پرامپت را بفرستید، سپس **فقط عکس** بفرستید.",
+        )
+        return
+
+    if data == "manus_clear_pick":
+        clear_picked_prompt(user_id)
+        answer("پرامپت انتخاب‌شده پاک شد", True)
+        bot.edit_message_text(
+            manus_intro_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(user_id),
+        )
+        return
+
+    if data.startswith("prompt_use:"):
+        name = data.split(":", 1)[1]
+        pick = pick_saved_prompt(user_id, name)
+        if not pick:
+            answer("پیدا نشد", True)
+            return
+        set_bot_mode(user_id, BOT_MODE_MANUS)
+        answer(f"فعال: {name}", True)
+        bot.edit_message_text(
+            f"✅ پرامپت **{name}** فعال شد.\n🎯 حالت: Manus\n\n"
+            "حالا **فقط عکس** بفرستید.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(user_id),
+        )
+        return
+
+    if data.startswith("prompt_del:"):
+        name = data.split(":", 1)[1]
+        delete_user_prompt(user_id, name)
+        answer("حذف شد", True)
+        bot.edit_message_text(
+            my_prompts_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_my_prompts_keyboard(user_id),
+        )
+        return
+
     # ----- Manus agent mode -----
     if data == "menu_manus":
         answer()
@@ -3356,12 +3816,14 @@ def handle_callbacks(call):
             manus_intro_text(user_id),
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=get_manus_keyboard(),
+            reply_markup=get_manus_keyboard(user_id),
         )
         return
 
     if data == "manus_run":
+        set_bot_mode(user_id, BOT_MODE_MANUS)
         manus_clear_session(user_id)
+        # keep saved prompt pick unless cleared
         PENDING[user_id] = {"action": "manus_prompt"}
         answer()
         bot.send_message(
@@ -3403,7 +3865,7 @@ def handle_callbacks(call):
             "⛔️ حالت ادیت Manus پایان یافت.\nبرای شروع: `/manus`",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=get_manus_keyboard(),
+            reply_markup=get_manus_keyboard(user_id),
         )
         return
 
@@ -3429,7 +3891,7 @@ def handle_callbacks(call):
             "🧹 قفل/صف Manus پاک شد. دوباره `/manus` را بزنید.",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=get_manus_keyboard(),
+            reply_markup=get_manus_keyboard(user_id),
         )
         return
 
@@ -3456,7 +3918,7 @@ def handle_callbacks(call):
                 manus_intro_text(user_id),
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=get_manus_keyboard(),
+                reply_markup=get_manus_keyboard(user_id),
             )
             return
         text = manus_credits_text(api_key)
@@ -3477,7 +3939,7 @@ def handle_callbacks(call):
             manus_intro_text(user_id),
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=get_manus_keyboard(),
+            reply_markup=get_manus_keyboard(user_id),
         )
         return
 
@@ -3533,7 +3995,7 @@ def handle_callbacks(call):
         settings = get_user_settings(user_id)
         keys = list_user_keys(user_id)
         bot.edit_message_text(
-            settings_overview_text(settings, keys, STREAMING_ENABLED),
+            settings_overview_text(settings, keys, STREAMING_ENABLED, user_id=user_id),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_settings_keyboard(
@@ -3578,7 +4040,7 @@ def handle_callbacks(call):
         if settings.get("stream_enabled") is not None:
             effective = bool(settings.get("stream_enabled"))
         bot.edit_message_text(
-            settings_overview_text(settings, list_user_keys(user_id), effective),
+            settings_overview_text(settings, list_user_keys(user_id), effective, user_id=user_id),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_settings_keyboard(
@@ -3618,7 +4080,7 @@ def handle_callbacks(call):
         )
         settings = get_user_settings(user_id)
         bot.edit_message_text(
-            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED),
+            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED, user_id=user_id),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_settings_keyboard(
@@ -3648,7 +4110,7 @@ def handle_callbacks(call):
         answer("ذخیره شد" if ok else "ذخیره نشد — sql/02", not ok)
         settings = get_user_settings(user_id)
         bot.edit_message_text(
-            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED),
+            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED, user_id=user_id),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_settings_keyboard(
@@ -3788,7 +4250,7 @@ def handle_callbacks(call):
         answer(f"{provider} · {model_id}", True)
         settings = get_user_settings(user_id)
         bot.edit_message_text(
-            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED),
+            settings_overview_text(settings, list_user_keys(user_id), STREAMING_ENABLED, user_id=user_id),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_settings_keyboard(
@@ -3916,7 +4378,7 @@ def handle_cancel(message):
 
 @bot.message_handler(content_types=["photo", "document"], func=lambda m: True)
 def handle_manus_media(message):
-    """Photo/document for Manus: new task or follow-up on same task."""
+    """Photo/document for Manus (or mode guidance for Dahl chat)."""
     user_id = message.from_user.id
     pending = PENDING.get(user_id) or {}
     caption = (message.caption or "").strip()
@@ -3926,34 +4388,75 @@ def handle_manus_media(message):
     except Exception:
         session = None
     manus_reap_stale_locks()
+    ensure_user(message.from_user)
+    mode = get_bot_mode(user_id)
+    pick = get_picked_prompt(user_id)
+
+    # Exclusive chat mode: photos are not processed as Manus
+    if mode == BOT_MODE_CHAT and action not in ("manus_prompt", "manus_followup"):
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🎨 Manus (تصویر)", callback_data="mode_manus"))
+        markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
+        bot.reply_to(
+            message,
+            "🎯 حالت فعلی **چت با دال** است — عکس در این حالت پردازش نمی‌شود.\n\n"
+            "برای ساخت/ویرایش عکس: **🎨 Manus** را بزنید\n"
+            "پرامپت بلند: **📝 پرامپت‌های من** → سپس فقط عکس",
+            reply_markup=markup,
+        )
+        return
 
     status = None
     try:
-        # Follow-up on existing Manus task
-        if action == "manus_followup" or (session and action != "manus_prompt"):
-            ensure_user(message.from_user)
-            status = bot.reply_to(message, "⏬ دریافت فایل برای ادیت در همان گفتگوی Manus…")
+        # Saved prompt + photo (no caption needed)
+        if pick and not caption and action not in ("manus_prompt",):
+            status = bot.reply_to(
+                message,
+                f"⏬ عکس + پرامپت سیو شده **{pick.get('name')}**\nدر حال آماده‌سازی…",
+            )
             attachment, att_err = extract_media_from_message(message)
-            if not attachment and not caption:
+            if not attachment:
                 bot.edit_message_text(
-                    f"❌ فایل دریافت نشد و کپشن هم خالی است.\n{att_err}",
+                    f"❌ دریافت عکس ناموفق بود.\n{att_err}",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
                 return
-            prompt = caption or (
-                "Continue from the previous result. Apply a sensible refinement "
-                "and briefly describe the change."
+            set_bot_mode(user_id, BOT_MODE_MANUS)
+            followup = bool(session) and action == "manus_followup"
+            ok = run_manus_for_user(
+                message,
+                pick.get("prompt") or "",
+                user_id=user_id,
+                chat_id=message.chat.id,
+                attachments=[attachment],
+                followup=followup,
             )
-            try:
+            if not ok:
                 bot.edit_message_text(
-                    f"✅ فایل آماده شد ({'با پیوست' if attachment else 'فقط متن'})\n"
-                    "در حال ثبت درخواست…",
+                    "❌ ثبت درخواست Manus ناموفق. `/manusdebug`",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
-            except Exception:
-                pass
+            return
+
+        # Follow-up on existing Manus task
+        if action == "manus_followup" or (session and mode == BOT_MODE_MANUS and action != "manus_prompt"):
+            status = bot.reply_to(message, "⏬ دریافت فایل برای ادیت در همان گفتگوی Manus…")
+            attachment, att_err = extract_media_from_message(message)
+            prompt = caption or (pick.get("prompt") if pick else "") or (
+                "Continue from the previous result. Apply a sensible refinement "
+                "and briefly describe the change."
+            )
+            if not attachment and not caption and not pick:
+                # empty → Dahl if possible
+                bot.edit_message_text(
+                    "کپشن/پرامپت سیو شده ندارید — تلاش با دال…",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+                _dahl_fallback_reply(message, user_id, note="Manus بدون پرامپت:")
+                return
             ok = run_manus_for_user(
                 message,
                 prompt,
@@ -3965,7 +4468,7 @@ def handle_manus_media(message):
             if not ok:
                 try:
                     bot.edit_message_text(
-                        "❌ درخواست Manus ثبت نشد. `/manusdebug` را بزنید.",
+                        "❌ درخواست Manus ثبت نشد. `/manusdebug`",
                         chat_id=status.chat.id,
                         message_id=status.message_id,
                     )
@@ -3975,42 +4478,50 @@ def handle_manus_media(message):
 
         if action != "manus_prompt":
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("🎨 Manus Agent", callback_data="menu_manus"))
+            markup.row(InlineKeyboardButton("📝 انتخاب پرامپت سیو شده", callback_data="manus_pick_prompt"))
+            markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
+            markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
             bot.reply_to(
                 message,
-                "برای ویرایش/تحلیل عکس با **Manus**:\n"
-                "1) `/manus`\n"
-                "2) **اجرای تسک جدید**\n"
-                "3) **عکس + کپشن**\n\n"
-                "پس از اولین نتیجه، می‌توانید عکس/متن بعدی را بفرستید تا **در همان گفتگو** ادیت شود.",
+                "برای Manus:\n"
+                "1) 🎨 Manus یا `/mode manus`\n"
+                "2) **استفاده از پرامپت سیو شده** → نام پرامپت\n"
+                "3) **فقط عکس** بفرستید\n"
+                "یا «اجرای تسک جدید» → عکس + کپشن",
                 reply_markup=markup,
             )
             return
 
         PENDING.pop(user_id, None)
         manus_clear_session(user_id)
-        ensure_user(message.from_user)
+        set_bot_mode(user_id, BOT_MODE_MANUS)
 
         status = bot.reply_to(message, "⏬ دریافت فایل و آماده‌سازی برای Manus…")
         attachment, att_err = extract_media_from_message(message)
         if not attachment:
             bot.edit_message_text(
-                f"❌ دریافت عکس/فایل از تلگرام ناموفق بود.\n{att_err}\n\n"
-                "عکس کوچک‌تر بفرستید یا فقط متن بفرستید.",
+                f"❌ دریافت عکس/فایل ناموفق بود.\n{att_err}",
                 chat_id=status.chat.id,
                 message_id=status.message_id,
             )
             return
 
-        prompt = caption or (
+        prompt = caption or (pick.get("prompt") if pick else "") or (
             "Edit this image: keep the main subject, improve quality/style, "
             "and briefly describe what you changed."
         )
+        if not caption and not pick:
+            bot.edit_message_text(
+                "کپشن ندارید و پرامپت سیو شده هم انتخاب نشده — تلاش با دال…",
+                chat_id=status.chat.id,
+                message_id=status.message_id,
+            )
+            _dahl_fallback_reply(message, user_id, note="عکس بدون پرامپت Manus:")
+            return
+
         try:
             bot.edit_message_text(
-                f"✅ فایل آماده شد ({len(attachment.get('file_data',''))//1024}KB base64)\n"
-                f"پرامپت: `{prompt[:60]}`\n"
-                "در حال ارسال به Manus…",
+                f"✅ فایل آماده · پرامپت: `{prompt[:50]}`\nارسال به Manus…",
                 chat_id=status.chat.id,
                 message_id=status.message_id,
             )
@@ -4027,8 +4538,7 @@ def handle_manus_media(message):
         if not ok:
             try:
                 bot.edit_message_text(
-                    "❌ درخواست Manus ثبت نشد (کلید؟ صف؟ لاک؟)\n"
-                    "`/manusdebug` را بزنید.",
+                    "❌ درخواست Manus ثبت نشد. `/manusdebug`",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
@@ -4039,12 +4549,12 @@ def handle_manus_media(message):
         try:
             if status:
                 bot.edit_message_text(
-                    f"❌ خطای داخلی هنگام آماده‌سازی Manus:\n`{str(e)[:250]}`",
+                    f"❌ خطای داخلی Manus:\n`{str(e)[:250]}`",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
             else:
-                bot.reply_to(message, f"❌ خطای داخلی Manus:\n`{str(e)[:250]}`")
+                bot.reply_to(message, f"❌ خطای داخلی:\n`{str(e)[:250]}`")
         except Exception:
             pass
 
@@ -4078,16 +4588,98 @@ def _handle_pending_input(message) -> bool:
         )
         return True
 
+    if action == "prompt_save_name":
+        name = (pending.get("name") or raw or "").strip()[:64]
+        if not name:
+            bot.reply_to(message, "نام خالی است. دوباره `/saveprompt`.")
+            return True
+        if not raw or (pending.get("name") and len(raw) > 2 and pending.get("awaiting_prompt") != True and pending.get("name") == raw.strip() and False):
+            pass
+        # If name came from command and this message is the prompt text
+        if pending.get("name") and pending.get("await_text"):
+            prompt = raw
+            if len(prompt) < 5:
+                bot.reply_to(message, "متن پرامپت خیلی کوتاه است.")
+                return True
+            PENDING.pop(user_id, None)
+            ok = save_user_prompt(user_id, pending["name"], prompt)
+            bot.reply_to(
+                message,
+                f"{'✅' if ok else '⚠️'} پرامپت **{pending['name']}** ذخیره شد "
+                f"({len(prompt)} کاراکتر).\n\n"
+                "برای استفاده: 🎨 Manus → **استفاده از پرامپت سیو شده** → فقط عکس بفرست.",
+                reply_markup=get_my_prompts_keyboard(user_id),
+            )
+            return True
+        # This message is the name → ask for text
+        if not pending.get("name"):
+            name = raw.strip()[:64]
+            if not name:
+                bot.reply_to(message, "نام خالی است.")
+                return True
+            PENDING[user_id] = {"action": "prompt_save_name", "name": name, "await_text": True}
+            bot.reply_to(message, f"📝 نام: **{name}**\n\nمتن کامل پرامپت را بفرستید:")
+            return True
+        # name already set from /saveprompt name → this is prompt text
+        prompt = raw
+        if len(prompt) < 5:
+            bot.reply_to(message, "متن پرامپت خیلی کوتاه است. متن بلندتر بفرستید.")
+            return True
+        pname = pending.get("name")
+        PENDING.pop(user_id, None)
+        ok = save_user_prompt(user_id, pname, prompt)
+        bot.reply_to(
+            message,
+            f"{'✅' if ok else '⚠️'} پرامپت **{pname}** ذخیره شد ({len(prompt)} کاراکتر).\n\n"
+            "🎨 Manus → استفاده از پرامپت سیو شده → عکس",
+            reply_markup=get_my_prompts_keyboard(user_id),
+        )
+        return True
+
+    if action == "prompt_pick_name":
+        name = raw.strip()
+        PENDING.pop(user_id, None)
+        pick = pick_saved_prompt(user_id, name)
+        if not pick:
+            bot.reply_to(
+                message,
+                "پرامپتی با این نام پیدا نشد.\n`/myprompts` را ببینید.",
+                reply_markup=get_my_prompts_keyboard(user_id),
+            )
+            return True
+        set_bot_mode(user_id, BOT_MODE_MANUS)
+        bot.reply_to(
+            message,
+            f"✅ پرامپت **{pick['name']}** انتخاب شد ({len(pick['prompt'])} کاراکتر).\n"
+            f"🎯 حالت: **Manus**\n\n"
+            "حالا فقط **عکس** بفرستید (کپشن لازم نیست).\n"
+            "اگر کپشن بدهید، همان جایگزین پرامپت سیو شده می‌شود.",
+            reply_markup=get_manus_keyboard(user_id),
+        )
+        return True
+
     if action == "manus_prompt":
         prompt = pending.get("preset") or raw
         PENDING.pop(user_id, None)
         manus_clear_session(user_id)
         if not prompt or not prompt.strip():
+            # empty → try Dahl if available
+            cred = resolve_inference_credentials(user_id)
+            if cred:
+                bot.reply_to(
+                    message,
+                    "ℹ️ پرامپت Manus خالی بود — تلاش با **چت دال**…",
+                )
+                # fall through by setting a synthetic request? send directly:
+                _dahl_fallback_reply(
+                    message,
+                    user_id,
+                    note="ℹ️ پرامپت Manus خالی بود — پاسخ از **چت دال**:",
+                )
+                return True
             bot.reply_to(
                 message,
-                "پرامپت خالی است.\n"
-                "متن بفرستید یا **عکس + کپشن** بفرستید.\n"
-                "دوباره: `/manus`",
+                "پرامپت خالی است. `/manus` یا پرامپت سیو شده انتخاب کنید.",
             )
             return True
         run_manus_for_user(
@@ -4223,20 +4815,43 @@ def handle_chat(message):
     if _handle_pending_input(message):
         return
 
-    # Open Manus session: edit-like text continues the same task
-    sess = manus_get_session(user_id)
-    if sess and _looks_like_manus_followup(text):
-        ensure_user(message.from_user)
+    ensure_user(message.from_user)
+    mode = get_bot_mode(user_id)
+
+    # Exclusive Manus mode: text goes to Manus (or Dahl fallback if empty)
+    if mode == BOT_MODE_MANUS:
+        pick = get_picked_prompt(user_id)
+        prompt = text.strip()
+        if not prompt and pick:
+            prompt = pick.get("prompt") or ""
+        if not prompt:
+            _dahl_fallback_reply(
+                message,
+                user_id,
+                note="🎯 حالت Manus بود ولی متن خالی بود — تلاش با **دال**:",
+            )
+            return
         run_manus_for_user(
             message,
-            text.strip(),
+            prompt,
             user_id=user_id,
             chat_id=message.chat.id,
-            followup=True,
+            followup=False,
         )
         return
 
-    ensure_user(message.from_user)
+    # Chat mode: Manus-like text is ignored; Dahl/OpenAI path only
+    sess = manus_get_session(user_id)
+    if sess and _looks_like_manus_followup(text):
+        bot.reply_to(
+            message,
+            "🎯 حالت فعلی **چت با دال** است.\n"
+            "برای ادیت Manus از منوی اصلی **🎨 Manus** را بزنید.\n"
+            "`/mode manus`",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
     settings = get_user_settings(user_id)
     model_ref = settings["selected_model"]
     response_style = settings.get("response_style", "html")

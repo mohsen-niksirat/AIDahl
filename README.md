@@ -21,6 +21,8 @@ OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API ke
 - **Lifetime + daily token quotas** with near-limit warnings
 - **Storage hygiene**: only the **active** conversation stays in Supabase; new chat purges old server-side history
 - **Manus Agent** (`/manus`) — create/edit images via official Manus API v2; **multi-turn follow-up** on the same task; **concurrency queue** for free-tier RAM
+- **Exclusive modes**: 💬 Dahl chat vs 🎨 Manus (`/mode`)
+- **Saved prompts** (`/saveprompt`, `/myprompts`) for long text + photo-only Manus runs
 - **Promptopia** button — open ready-made prompts in the browser (`/prompts`)
 - **Admin stats** `/admin`
 - **Debug tools**: `/manusdebug`, `/manusreset`
@@ -49,6 +51,7 @@ cp .env.example .env
    - `sql/02_user_settings.sql`
    - `sql/03_phase5.sql`
    - `sql/04_storage_lifetime.sql`
+   - `sql/05_user_prompts_modes.sql`
 6. Run locally:
 
 ```bash
@@ -128,7 +131,7 @@ See [`.env.example`](.env.example).
 
 ### Database
 `users`, `conversations` (active only), `messages` (trimmed), `user_api_keys`, `user_quotas`  
-SQL: `sql/01` → `02` → `03` → `04`.
+SQL: `sql/01` → `02` → `03` → `04` → `05`.
 
 ### Security
 - Never commit `.env`. Rotate leaked tokens.
