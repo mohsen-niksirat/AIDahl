@@ -66,6 +66,7 @@ for _part in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(","):
 
 MAX_TG_MESSAGE = 4000
 CHAT_LIST_LIMIT = 15
+BOT_VERSION = os.getenv("BOT_VERSION", "1.0.0-final")
 PROMPTOPIA_URL = os.getenv("PROMPTOPIA_URL", "https://mohsen-niksirat.github.io/promptopia/").strip()
 PROMPTOPIA_LABEL = os.getenv("PROMPTOPIA_LABEL", "📚 پرامپت‌های آماده")
 
@@ -1563,12 +1564,29 @@ def manus_extract_from_messages(messages: List[dict]) -> dict:
     }
 
 
-def manus_collect_files(api_key: str, task_id: str, extra_limit: int = 50) -> List[dict]:
-    """Harvest file URLs from listMessages + task.detail."""
+def manus_collect_files(
+    api_key: str,
+    task_id: str,
+    extra_limit: int = 50,
+    exclude_urls: Optional[set] = None,
+    newest_only: bool = False,
+) -> List[dict]:
+    """
+    Harvest file URLs from listMessages + task.detail.
+    exclude_urls: skip URLs already delivered (follow-up turns).
+    newest_only: prefer files found in the newest messages first.
+    """
     files: List[dict] = []
     texts: List[str] = []
+    newest_files: List[dict] = []
     try:
         msgs = manus_list_messages(api_key, task_id, limit=extra_limit)
+        # listMessages is usually newest-first
+        if newest_only and msgs:
+            for item in msgs[:12]:
+                bucket: List[dict] = []
+                _walk_manus_files(item, bucket, texts)
+                newest_files.extend(bucket)
         ex = manus_extract_from_messages(msgs)
         files.extend(ex.get("files") or [])
         texts.extend([ex.get("text") or ""])
@@ -1580,19 +1598,45 @@ def manus_collect_files(api_key: str, task_id: str, extra_limit: int = 50) -> Li
             _walk_manus_files(detail, files, texts)
     except Exception as e:
         logging.error(f"collect from detail: {e}")
+
+    if newest_only and newest_files:
+        files = newest_files + files
+
+    exclude = set(exclude_urls or ())
     seen = set()
     out = []
     for f in files:
         u = f.get("url")
-        if u and u not in seen:
-            seen.add(u)
-            out.append(f)
+        if not u or u in seen or u in exclude:
+            continue
+        seen.add(u)
+        out.append(f)
     out.sort(key=lambda f: (
         0 if str(f.get("mime", "")).startswith("image") or any(
             x in str(f.get("url", "")).lower() for x in _IMAGE_EXT
         ) else 1
     ))
     return out
+
+
+def manus_mark_delivered(user_id: int, urls: List[str]):
+    sess = _MANUS_SESSIONS.get(user_id)
+    if not sess:
+        return
+    delivered = list(sess.get("delivered_urls") or [])
+    for u in urls:
+        if u and u not in delivered:
+            delivered.append(u)
+    # cap memory
+    sess["delivered_urls"] = delivered[-50:]
+    sess["updated_at"] = time.time()
+
+
+def manus_delivered_urls(user_id: int) -> set:
+    sess = manus_get_session(user_id)
+    if not sess:
+        return set()
+    return set(sess.get("delivered_urls") or ())
 
 
 def manus_download_file(url: str, api_key: str) -> Optional[bytes]:
@@ -1798,30 +1842,42 @@ def manus_deliver_result(
     task_url: Optional[str],
     api_key: Optional[str] = None,
     task_id: Optional[str] = None,
-):
-    """Send final Manus output to Telegram — text + photo + original file."""
+    exclude_urls: Optional[set] = None,
+    followup: bool = False,
+    user_id: Optional[int] = None,
+) -> List[str]:
+    """Send final Manus output to Telegram — text + NEW photo/file only."""
     status = result.get("agent_status") or "?"
     text = (result.get("text") or "").strip()
-    files = list(result.get("files") or [])
+    exclude = set(exclude_urls or ())
+    files = [f for f in (result.get("files") or []) if f.get("url") not in exclude]
     error = result.get("error")
     timed_out = result.get("timed_out")
 
-    # last-chance harvest if we have credentials
+    # last-chance harvest if we have credentials — skip already-delivered URLs
     if api_key and task_id:
         try:
-            more = manus_collect_files(api_key, task_id)
+            more = manus_collect_files(
+                api_key,
+                task_id,
+                exclude_urls=exclude,
+                newest_only=followup,
+            )
             have = {f.get("url") for f in files}
             for f in more:
-                if f.get("url") not in have:
+                u = f.get("url")
+                if u and u not in have and u not in exclude:
                     files.append(f)
-                    have.add(f.get("url"))
+                    have.add(u)
         except Exception as e:
             logging.warning(f"deliver harvest: {e}")
+
+    sent_urls: List[str] = []
 
     if status == "error" or error:
         msg = f"❌ Manus agent خطا داد.\n`{error or status}`"
         if files:
-            msg += f"\nفایل‌های موجود: {len(files)}"
+            msg += f"\nفایل‌های جدید: {len(files)}"
         if task_url:
             msg += f"\n{task_url}"
         try:
@@ -1833,7 +1889,7 @@ def manus_deliver_result(
             )
         except Exception:
             bot.send_message(chat_id, msg)
-        # still try to deliver any files found
+        # still try to deliver any NEW files found
     elif status == "waiting":
         detail = result.get("status_detail") or {}
         waiting_desc = detail.get("waiting_description") or detail.get("waiting_for_event_type") or ""
@@ -1853,11 +1909,18 @@ def manus_deliver_result(
             )
         except Exception:
             bot.send_message(chat_id, msg)
-        return
+        return sent_urls
     else:
-        final = text or "✅ Manus task تمام شد."
-        if files:
-            final += f"\n\n📦 فایل‌ها: {len(files)} — عکس preview + فایل اصلی در پیام‌های بعدی"
+        if followup:
+            final = text or "✅ ادیت Manus تمام شد."
+            if files:
+                final += f"\n\n📦 فایل‌های **جدید** این نوبت: {len(files)}"
+            else:
+                final += "\n\nℹ️ فایل جدیدی در این نوبت پیدا نشد (فقط پاسخ متنی)."
+        else:
+            final = text or "✅ Manus task تمام شد."
+            if files:
+                final += f"\n\n📦 فایل‌ها: {len(files)} — preview + فایل اصلی در پیام‌های بعدی"
         if task_url:
             final += f"\n\n🔗 {task_url}"
         try:
@@ -1876,20 +1939,29 @@ def manus_deliver_result(
                 bot.send_message(chat_id, truncate_message(final))
 
     if not files:
-        bot.send_message(
-            chat_id,
-            "⚠️ هیچ URL فایل/عکسی در payload پیدا نشد.\n"
-            "اگر عکس در manus.im هست، API هنوز لینک قابل دانلود برنگردانده "
-            "یا ساختار پیام تغییر کرده است.\n"
-            f"{task_url or ''}",
+        if followup:
+            bot.send_message(
+                chat_id,
+                "ℹ️ نتیجه جدید آمد ولی فایل/عکس **تازه**‌ای برای ارسال نبود.\n"
+                "اگر Manus تصویر تولید کرده، لینک را در task ببینید:\n"
+                f"{task_url or ''}",
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                "⚠️ هیچ URL فایل/عکسی در payload پیدا نشد.\n"
+                f"{task_url or ''}",
+            )
+        logging.warning(
+            f"manus deliver: no NEW files. status={status} task={task_id} "
+            f"followup={followup} excluded={len(exclude)}"
         )
-        logging.warning(f"manus deliver: no files. status={status} task={task_id}")
-        return
+        return sent_urls
 
     delivered = 0
     for f in files[:6]:
         url = f.get("url")
-        if not url:
+        if not url or url in exclude:
             continue
         name = f.get("name") or _filename_from_url(url)
         content = None
@@ -1907,6 +1979,7 @@ def manus_deliver_result(
         try:
             manus_send_file_pair(chat_id, content, name, f)
             delivered += 1
+            sent_urls.append(url)
         except Exception as e:
             logging.error(f"deliver file pair failed: {e}")
             try:
@@ -1917,6 +1990,10 @@ def manus_deliver_result(
     if delivered == 0:
         links = "\n".join(f"• {f.get('name')}: {f.get('url')}" for f in files[:4])
         bot.send_message(chat_id, f"فایل دانلود نشد. لینک‌ها:\n{links}")
+
+    if user_id and sent_urls:
+        manus_mark_delivered(user_id, sent_urls)
+    return sent_urls
 
 
 def manus_queue_stats() -> dict:
@@ -1944,12 +2021,21 @@ def manus_queue_status_text() -> dict:
     }
 
 
-def manus_save_session(user_id: int, task_id: str, task_url: Optional[str] = None, title: str = ""):
+def manus_save_session(
+    user_id: int,
+    task_id: str,
+    task_url: Optional[str] = None,
+    title: str = "",
+    keep_delivered: bool = False,
+):
+    prev = _MANUS_SESSIONS.get(user_id) or {}
+    delivered = list(prev.get("delivered_urls") or []) if keep_delivered else []
     _MANUS_SESSIONS[user_id] = {
         "task_id": task_id,
         "task_url": task_url or (f"https://manus.im/app/{task_id}" if task_id else None),
         "updated_at": time.time(),
         "title": (title or "")[:60],
+        "delivered_urls": delivered,
     }
 
 
@@ -2380,8 +2466,15 @@ def _execute_manus_job(job: dict):
     if not task_id:
         return
 
-    # Remember this task for follow-up edits
-    manus_save_session(user_id, task_id, task_url, title=prompt[:60])
+    # Remember this task for follow-up edits (keep delivered-URL memory on same task)
+    manus_save_session(
+        user_id,
+        task_id,
+        task_url,
+        title=prompt[:60],
+        keep_delivered=(mode == "followup"),
+    )
+    exclude = manus_delivered_urls(user_id) if mode == "followup" else set()
 
     try:
         active = get_active_conversation(user_id, get_user_model(user_id))
@@ -2411,6 +2504,11 @@ def _execute_manus_job(job: dict):
             pass
 
     result = manus_wait_for_task(api_key, task_id, on_progress=on_progress)
+    # On follow-up, do not re-send files from previous turns
+    if mode == "followup":
+        result["files"] = [
+            f for f in (result.get("files") or []) if f.get("url") not in exclude
+        ]
     manus_deliver_result(
         chat_id,
         status_msg,
@@ -2418,6 +2516,9 @@ def _execute_manus_job(job: dict):
         task_url,
         api_key=api_key,
         task_id=task_id,
+        exclude_urls=exclude if mode == "followup" else set(),
+        followup=(mode == "followup"),
+        user_id=user_id,
     )
 
     # Stay in follow-up mode so the next photo/text continues this task
@@ -2960,7 +3061,8 @@ def handle_start(message):
         f"📝 **فرمت:** `{style}`\n"
         f"⚡ **استریم:** `{'روشن' if STREAMING_ENABLED else 'خاموش'}`\n"
         f"💬 **گفتگو:** `{(str(conv.get('id',''))[:8] + '…')}`\n"
-        f"📊 **سهمیه امروز:** `{q['used']:,}` / `{q['limit']:,}`\n\n"
+        f"📊 **سهمیه امروز:** `{q['used']:,}` / `{q['limit']:,}`\n"
+        f"🧾 نسخه ربات: `{BOT_VERSION}`\n\n"
         "مدل، فرمت و گفتگوها از **⚙️ تنظیمات**.\n"
         "پرامپت آماده می‌خواهی؟ **📚** یا `/prompts` (در مرورگر باز می‌شود)\n"
         "دستورات: `/settings` `/keys` `/chats` `/manus` `/prompts` `/clear` `/help`"
@@ -3127,19 +3229,29 @@ def handle_manus_debug(message):
     has_key = bool(keys.get("manus", {}).get("api_key")) or bool(MANUS_SHARED_API_KEY)
     ping = "—"
     try:
+        key_for_ping = get_manus_key(user_id) or "invalid"
         with httpx.Client(timeout=8.0) as client:
-            r = client.get(f"{MANUS_BASE_URL}/v2/user.me", headers=manus_headers(
-                get_manus_key(user_id) or "invalid"
-            ))
+            r = client.get(
+                f"{MANUS_BASE_URL}/v2/usage.availableCredits",
+                headers=manus_headers(key_for_ping),
+            )
         ping = f"HTTP {r.status_code}"
         if r.status_code == 200:
-            ping += " (key OK)"
-        elif r.status_code == 401:
+            try:
+                d = (r.json() or {}).get("data") or {}
+                ping += f" · credits={d.get('total_credits', '?')}"
+            except Exception:
+                ping += " (key OK)"
+        elif r.status_code in (401,):
             ping += " (key invalid)"
+        elif r.status_code in (403,):
+            ping += " (endpoint forbidden — key may still work for task.create)"
+        elif r.status_code == 402:
+            ping += " (no credits / not allocated)"
     except Exception as e:
         ping = f"error: {e}"
     text = (
-        "🔧 **Manus debug**\n\n"
+        f"🔧 **Manus debug** · v`{BOT_VERSION}`\n\n"
         f"کلید Manus: `{'دارد' if keys.get('manus') else 'ندارد'}` · "
         f"مشترک: `{'ست' if MANUS_SHARED_API_KEY else '—'}` · "
         f"قابل استفاده: `{'بله' if has_key else 'خیر'}`\n"
@@ -3150,9 +3262,11 @@ def handle_manus_debug(message):
         f"queued `{stats['queued']}`\n"
         f"شما در running set: `{user_id in _MANUS_RUNNING_USERS}`\n"
         f"شما در queued set: `{user_id in _MANUS_QUEUED_USERS}`\n"
-        f"API ping: {ping}\n"
+        f"API credits ping: {ping}\n"
         f"base: `{MANUS_BASE_URL}`\n"
-        f"timeout: `{MANUS_TIMEOUT_SEC}s` · stale: `{MANUS_STALE_LOCK_SEC}s`"
+        f"timeout: `{MANUS_TIMEOUT_SEC}s` · stale: `{MANUS_STALE_LOCK_SEC}s`\n"
+        f"سهمیه کلی: `{quota_status(user_id).get('lifetime_used', 0):,}` / "
+        f"`{quota_status(user_id).get('lifetime_limit', 0):,}`"
     )
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("🧹 پاک‌سازی قفل/صف", callback_data="manus_reset_btn"))

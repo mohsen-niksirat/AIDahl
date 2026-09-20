@@ -6,7 +6,8 @@ OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API ke
 
 **Full setup tutorial (FA):** [docs/SETUP_FA.md](docs/SETUP_FA.md)  
 **Privacy:** [privacy_policy.md](privacy_policy.md)  
-**Prompts gallery:** https://mohsen-niksirat.github.io/promptopia/
+**Prompts gallery:** https://mohsen-niksirat.github.io/promptopia/  
+**Release:** `1.0.0-final` (`BOT_VERSION`)
 
 ---
 
