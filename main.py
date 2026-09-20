@@ -4,6 +4,7 @@ import json
 import html
 import uuid
 import time
+import base64
 import logging
 from datetime import datetime, timezone, date
 from collections import defaultdict
@@ -24,6 +25,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TOKEN_QUOTA = int(os.getenv("TOKEN_QUOTA", "1000000"))
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))
 ALLOW_SHARED_KEY = os.getenv("ALLOW_SHARED_KEY", "true").lower() in ("1", "true", "yes")
+
+# Manus agent mode (async tasks — not OpenAI chat completions)
+MANUS_BASE_URL = os.getenv("MANUS_BASE_URL", "https://api.manus.ai").rstrip("/")
+MANUS_POLL_INTERVAL = float(os.getenv("MANUS_POLL_INTERVAL", "4"))
+MANUS_TIMEOUT_SEC = int(os.getenv("MANUS_TIMEOUT_SEC", "90"))
+MANUS_DEFAULT_PROFILE = os.getenv("MANUS_DEFAULT_PROFILE", "standard")  # standard|lite|max
+# Manus accepts documented locales like en, zh-CN, ja — omit if invalid
+MANUS_LOCALE = os.getenv("MANUS_LOCALE", "").strip()  # empty = send no locale
+# Optional shared Manus key if a user has no personal key
+MANUS_SHARED_API_KEY = os.getenv("MANUS_API_KEY") or os.getenv("MANUS_SHARED_API_KEY")
 
 STREAMING_ENABLED = os.getenv("STREAMING_ENABLED", "true").lower() in ("1", "true", "yes")
 STREAM_EDIT_INTERVAL = float(os.getenv("STREAM_EDIT_INTERVAL", "1.2"))
@@ -162,6 +173,20 @@ PROVIDERS: Dict[str, Dict[str, Any]] = {
             "gpt4o": {"name": "GPT-4o (catalog)", "id": "openai/gpt-4o"},
         },
         "default_model_id": "openai/gpt-4o",
+    },
+    "manus": {
+        "name": "Manus Agent",
+        "name_fa": "Manus (دستیار/تصویر)",
+        "base_url": "https://api.manus.ai",
+        "get_key_url": "https://manus.im/app#settings/developers",
+        "note_fa": (
+            "API از Settings→Developers در manus.im بسازید (یک‌بار نمایش داده می‌شود). "
+            "چت معمولی نیست؛ تسک agent اجرا می‌کند (متن + فایل/عکس). "
+            "سهمیه credits روزانه/هفتگی دارد."
+        ),
+        "models": {},
+        "default_model_id": None,
+        "kind": "agent",
     },
     "custom": {
         "name": "Custom OpenAI-compatible",
@@ -922,12 +947,519 @@ def call_llm(
 
 
 # ---------------------------------------------------------------------------
+# Manus agent mode (API v2 — async tasks)
+# Docs: https://open.manus.ai/docs
+# ---------------------------------------------------------------------------
+
+def manus_headers(api_key: str) -> dict:
+    return {
+        "x-manus-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+
+
+def get_manus_key(user_id: int) -> Optional[str]:
+    keys = list_user_keys(user_id)
+    row = keys.get("manus")
+    if row and row.get("api_key"):
+        return row["api_key"]
+    if MANUS_SHARED_API_KEY:
+        return MANUS_SHARED_API_KEY
+    return None
+
+
+def manus_create_task(
+    api_key: str,
+    prompt: str,
+    profile: Optional[str] = None,
+    attachments: Optional[List[dict]] = None,
+) -> dict:
+    """
+    attachments: list of Manus ContentPart file objects, e.g.
+      {"type": "file", "file_data": "data:image/jpeg;base64,...", "filename": "photo.jpg"}
+    """
+    profile = (profile or MANUS_DEFAULT_PROFILE or "standard").lower()
+    if profile not in ("standard", "lite", "max"):
+        profile = "standard"
+
+    text = (prompt or "").strip()[:4800]
+    if not text:
+        text = (
+            "Edit/improve this image. Keep the main subject, "
+            "return a polished result and briefly describe the changes."
+        )
+
+    content_parts: List[dict] = [{"type": "text", "text": text}]
+    if attachments:
+        for att in attachments:
+            if att and att.get("file_data"):
+                content_parts.append(att)
+
+    payload = {
+        "message": {"content": content_parts},
+        "agent_profile": profile,
+        "hide_in_task_list": False,
+        "interactive_mode": False,
+    }
+    # Only send locale when explicitly configured — "fa" was rejected by Manus API
+    if MANUS_LOCALE:
+        payload["locale"] = MANUS_LOCALE
+    with httpx.Client(timeout=60.0) as client:
+        res = client.post(
+            f"{MANUS_BASE_URL}/v2/task.create",
+            headers=manus_headers(api_key),
+            json=payload,
+        )
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
+    if res.status_code >= 400 or (isinstance(data, dict) and data.get("ok") is False):
+        err = (data or {}).get("error") or {}
+        raise RuntimeError(
+            f"Manus task.create {res.status_code}: {err.get('code') or ''} {err.get('message') or res.text[:200]}"
+        )
+    return {
+        "task_id": data.get("task_id"),
+        "task_url": data.get("task_url"),
+        "task_title": data.get("task_title"),
+        "share_url": data.get("share_url"),
+    }
+
+
+def telegram_file_url(file_path: str) -> str:
+    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+
+
+def download_telegram_file(file_path: str, timeout: float = 30.0) -> bytes:
+    url = telegram_file_url(file_path)
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        res = client.get(url)
+        res.raise_for_status()
+        return res.content
+
+
+def extract_media_from_message(message) -> Optional[dict]:
+    """
+    Build a Manus file ContentPart from a Telegram photo/document.
+    Returns {"type":"file","file_data":"data:mime;base64,...","filename":...} or None.
+    """
+    try:
+        if message.photo:
+            # largest size last
+            file_id = message.photo[-1].file_id
+            filename = "telegram_photo.jpg"
+            mime = "image/jpeg"
+        elif message.document:
+            file_id = message.document.file_id
+            filename = message.document.file_name or "telegram_document"
+            mime = message.document.mime_type or "application/octet-stream"
+        else:
+            return None
+
+        file_info = bot.get_file(file_id)
+        file_path = getattr(file_info, "file_path", None)
+        if not file_path:
+            return None
+        raw = download_telegram_file(file_path)
+        if not raw or len(raw) > 8 * 1024 * 1024:
+            # keep under Manus inline ~20MB decoded; 8MB is safer for base64+overhead
+            logging.warning(f"telegram media too large or empty: {len(raw) if raw else 0}")
+            return None
+        b64 = base64.b64encode(raw).decode("ascii")
+        if message.photo:
+            mime = "image/jpeg"
+            filename = "telegram_photo.jpg"
+        return {
+            "type": "file",
+            "file_data": f"data:{mime};base64,{b64}",
+            "filename": filename,
+            "mime_type": mime,
+        }
+    except Exception as e:
+        logging.error(f"extract_media_from_message: {e}")
+        return None
+
+
+def manus_list_messages(api_key: str, task_id: str, limit: int = 30) -> list:
+    url = (
+        f"{MANUS_BASE_URL}/v2/task.listMessages"
+        f"?task_id={task_id}&order=desc&limit={limit}"
+    )
+    with httpx.Client(timeout=20.0) as client:
+        res = client.get(url, headers=manus_headers(api_key))
+    try:
+        data = res.json()
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    # v2 wrap: {ok, messages/data/events}
+    for key in ("messages", "data", "events", "items"):
+        val = data.get(key)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict) and isinstance(val.get("messages"), list):
+            return val["messages"]
+        if isinstance(val, dict) and isinstance(val.get("data"), list):
+            return val["data"]
+    # maybe unwrapped list already handled; try nested under result
+    result = data.get("result")
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def manus_extract_from_messages(messages: List[dict]) -> dict:
+    """Parse Manus task events for final assistant text + file URLs."""
+    agent_status = None
+    status_detail = {}
+    assistant_texts: List[str] = []
+    files: List[dict] = []
+    error_text = None
+
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        etype = item.get("type") or item.get("event_type")
+
+        if etype == "status_update" or "status_update" in item:
+            su = item.get("status_update") or item
+            agent_status = su.get("agent_status") or agent_status
+            if su.get("status_detail"):
+                status_detail = su["status_detail"]
+
+        if etype == "error_message" or item.get("error_message"):
+            err = item.get("error_message")
+            if isinstance(err, dict):
+                error_text = err.get("message") or err.get("content") or str(err)
+            elif isinstance(err, str):
+                error_text = err
+
+        if etype == "assistant_message" or item.get("assistant_message"):
+            am = item.get("assistant_message") or item
+            content = am.get("content")
+            if isinstance(content, str) and content.strip():
+                assistant_texts.append(content.strip())
+            elif isinstance(content, list):
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") in (None, "text", "output_text") and part.get("text"):
+                        assistant_texts.append(str(part["text"]).strip())
+                    furl = part.get("fileUrl") or part.get("file_url") or part.get("url")
+                    if furl:
+                        files.append({
+                            "url": furl,
+                            "name": part.get("fileName") or part.get("filename") or "manus-file",
+                            "mime": part.get("mimeType") or part.get("mime_type") or "",
+                        })
+
+        # Generic file parts at event level
+        furl = item.get("fileUrl") or item.get("file_url") or item.get("url")
+        if furl and any(ext in str(furl).lower() for ext in (
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".md", ".zip"
+        )):
+            files.append({
+                "url": furl,
+                "name": item.get("fileName") or item.get("filename") or str(furl).split("/")[-1][:40],
+                "mime": item.get("mimeType") or item.get("mime_type") or "",
+            })
+
+    # de-dupe files by url
+    seen = set()
+    uniq_files = []
+    for f in files:
+        if f["url"] in seen:
+            continue
+        seen.add(f["url"])
+        uniq_files.append(f)
+
+    text = "\n\n".join(assistant_texts[-3:]) if assistant_texts else ""
+    return {
+        "agent_status": agent_status,
+        "status_detail": status_detail,
+        "text": text,
+        "files": uniq_files[:6],
+        "error": error_text,
+    }
+
+
+def manus_wait_for_task(
+    api_key: str,
+    task_id: str,
+    timeout_sec: Optional[int] = None,
+    on_progress=None,
+) -> dict:
+    """Poll Manus until stopped / waiting / error / timeout."""
+    deadline = time.time() + (timeout_sec or MANUS_TIMEOUT_SEC)
+    last = {
+        "agent_status": "running",
+        "status_detail": {},
+        "text": "",
+        "files": [],
+        "error": None,
+        "timed_out": False,
+        "task_id": task_id,
+    }
+    while time.time() < deadline:
+        messages = manus_list_messages(api_key, task_id)
+        extracted = manus_extract_from_messages(messages)
+        last.update({
+            "agent_status": extracted.get("agent_status") or last["agent_status"],
+            "status_detail": extracted.get("status_detail") or last.get("status_detail") or {},
+            "text": extracted.get("text") or last.get("text") or "",
+            "files": extracted.get("files") or last.get("files") or [],
+            "error": extracted.get("error"),
+        })
+        status = last.get("agent_status")
+        if on_progress:
+            try:
+                on_progress(last)
+            except Exception as e:
+                logging.warning(f"manus on_progress: {e}")
+        if status in ("stopped", "error", "waiting", "completed"):
+            return last
+        time.sleep(MANUS_POLL_INTERVAL)
+    last["timed_out"] = True
+    return last
+
+
+def manus_credits_text(api_key: str) -> str:
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            res = client.get(
+                f"{MANUS_BASE_URL}/v2/usage.availableCredits",
+                headers=manus_headers(api_key),
+            )
+        data = res.json() or {}
+        if not data.get("ok", True):
+            return "دریافت credits ناموفق بود."
+        d = data.get("data") or data
+        total = d.get("total_credits")
+        refresh = d.get("refresh_credits")
+        interval = d.get("refresh_interval") or "—"
+        nxt = d.get("next_refresh_time")
+        lines = [
+            "💳 **Manus credits**",
+            f"قابل مصرف: `{total}`",
+            f"refresh باقی‌مانده: `{refresh}` · دوره: `{interval}`",
+        ]
+        if nxt:
+            lines.append(f"refresh بعدی: `{nxt}` (unix)")
+        return "\n".join(lines)
+    except Exception as e:
+        logging.error(f"manus credits: {e}")
+        return f"خطا در دریافت credits: {e}"
+
+
+def manus_deliver_result(chat_id: int, status_msg, result: dict, task_url: Optional[str]):
+    """Send final Manus output to Telegram (text + up to a few files)."""
+    status = result.get("agent_status") or "?"
+    text = (result.get("text") or "").strip()
+    files = result.get("files") or []
+    error = result.get("error")
+    timed_out = result.get("timed_out")
+
+    if status == "error" or error:
+        msg = f"❌ Manus agent خطا داد.\n`{error or status}`"
+        if task_url:
+            msg += f"\n{task_url}"
+        try:
+            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(chat_id, msg)
+        return
+
+    if status == "waiting":
+        detail = result.get("status_detail") or {}
+        waiting_desc = detail.get("waiting_description") or detail.get("waiting_for_event_type") or ""
+        msg = (
+            "⏸ Manus در وضعیت **waiting** است (به ورودی/تأیید نیاز دارد).\n"
+            f"{waiting_desc}\n\n"
+            "برای ادامه در پنل Manus باز کنید."
+        )
+        if task_url:
+            msg += f"\n{task_url}"
+        try:
+            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(chat_id, msg)
+        return
+
+    if timed_out and not text and not files:
+        msg = (
+            "⌛️ Manus هنوز کار می‌کند یا پاسخ نداد (timeout).\n"
+            "بعداً task را در پنل Manus چک کنید."
+        )
+        if task_url:
+            msg += f"\n{task_url}"
+        try:
+            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(chat_id, msg)
+        return
+
+    final = text or "✅ Manus task تمام شد."
+    if task_url:
+        final += f"\n\n🔗 {task_url}"
+    try:
+        send_bot_reply(status_msg.chat.id, status_msg.message_id, final, style="html")
+    except Exception:
+        try:
+            bot.edit_message_text(truncate_message(final), chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode=None)
+        except Exception:
+            bot.send_message(chat_id, truncate_message(final))
+
+    # Send files (images / docs) — Telegram fetches URL server-side when possible
+    sent = 0
+    for f in files[:4]:
+        url = f.get("url")
+        if not url:
+            continue
+        name = (f.get("name") or "file")[:60]
+        mime = (f.get("mime") or "").lower()
+        lower = (url + name + mime).lower()
+        try:
+            if any(x in lower for x in (".png", ".jpg", ".jpeg", ".webp", ".gif", "image/")):
+                bot.send_photo(chat_id, url, caption=f"🖼 {name}")
+            else:
+                bot.send_document(chat_id, url, caption=f"📎 {name}")
+            sent += 1
+        except Exception as e:
+            logging.warning(f"manus send file failed: {e}")
+            try:
+                bot.send_message(chat_id, f"📎 فایل: {name}\n{url}")
+            except Exception:
+                pass
+    if files and sent == 0:
+        links = "\n".join(f"• {f.get('name')}: {f.get('url')}" for f in files[:4])
+        bot.send_message(chat_id, f"فایل‌های Manus:\n{links}")
+
+
+def run_manus_for_user(
+    message,
+    prompt: str,
+    user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    attachments: Optional[List[dict]] = None,
+):
+    """End-to-end Manus agent run for a Telegram user."""
+    if user_id is None:
+        user_id = message.from_user.id if message is not None else None
+    if chat_id is None:
+        chat_id = message.chat.id if message is not None else user_id
+    if user_id is None or chat_id is None:
+        logging.error("run_manus_for_user: missing user/chat id")
+        return
+    api_key = get_manus_key(user_id)
+    if not api_key:
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🔑 ثبت کلید Manus", callback_data="keys_set:manus"))
+        markup.row(InlineKeyboardButton("🌐 ساخت کلید", url="https://manus.im/app#settings/developers"))
+        bot.send_message(
+            chat_id,
+            "🔐 **Manus Agent** به کلید API نیاز دارد.\n\n"
+            "1. در manus.im ثبت‌نام کن\n"
+            "2. Settings → Developers → Create API Key\n"
+            "3. کلید را در ربات ثبت کن\n\n"
+            "کلید فقط یک‌بار نمایش داده می‌شود.",
+            reply_markup=markup,
+        )
+        return
+
+    has_media = bool(attachments)
+    media_note = " + پیوست عکس/فایل" if has_media else ""
+    status_msg = bot.send_message(
+        chat_id,
+        "🎨 **Manus Agent** در حال اجرا…\n"
+        f"پرامپت: `{prompt[:80]}`{media_note}\n"
+        f"profile: `{MANUS_DEFAULT_PROFILE}` · timeout: `{MANUS_TIMEOUT_SEC}s`\n"
+        "ممکن است چند دقیقه طول بکشد.",
+    )
+
+    try:
+        created = manus_create_task(api_key, prompt, attachments=attachments)
+    except Exception as e:
+        logging.error(f"manus create failed: {e}")
+        err_s = str(e)
+        hint = ""
+        if "401" in err_s or "unauthenticated" in err_s:
+            hint = "\nکلید نامعتبر است — از «کلیدهای من» اصلاح کنید."
+        elif "rate_limited" in err_s or "429" in err_s:
+            hint = "\nRate limit — چند لحظه صبر کنید (حدود ۱۰ task/دقیقه)."
+        elif "credit" in err_s.lower():
+            hint = "\nسهمیه credits کافی نیست."
+        elif "invalid_argument" in err_s:
+            hint = "\nورودی نامعتبر — پرامپت/فایل را ساده‌تر کنید."
+        bot.edit_message_text(
+            f"❌ خطا در ساخت Manus task.\n`{err_s[:300]}`{hint}",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            parse_mode="Markdown",
+        )
+        return
+
+    task_id = created.get("task_id")
+    task_url = created.get("task_url") or (
+        f"https://manus.im/app/{task_id}" if task_id else None
+    )
+    if not task_id:
+        bot.edit_message_text(
+            f"❌ task_id دریافت نشد.\n`{str(created)[:200]}`",
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id,
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        active = get_active_conversation(user_id, get_user_model(user_id))
+        save_message(
+            active.get("id", ""),
+            "user",
+            f"[manus{'+media' if has_media else ''}] {prompt}",
+        )
+    except Exception:
+        pass
+
+    def on_progress(state):
+        st = state.get("agent_status") or "running"
+        preview = (state.get("text") or "")[:120]
+        try:
+            bot.edit_message_text(
+                f"🎨 Manus `{st}`…\nTask: `{task_id}`\n{preview}",
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    result = manus_wait_for_task(api_key, task_id, on_progress=on_progress)
+    manus_deliver_result(chat_id, status_msg, result, task_url)
+
+    if result.get("text") or result.get("files"):
+        try:
+            active = get_active_conversation(user_id, get_user_model(user_id))
+            save_message(
+                active.get("id", ""),
+                "assistant",
+                (result.get("text") or "")[:4000]
+                or f"[manus files] {len(result.get('files') or [])}",
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Keyboards
 # ---------------------------------------------------------------------------
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
+    markup.row(InlineKeyboardButton("🎨 Manus Agent (تصویر/تحقیق)", callback_data="menu_manus"))
     markup.row(
         InlineKeyboardButton("🤖 مدل فعال", callback_data="menu_models"),
         InlineKeyboardButton("💬 گفتگوها", callback_data="menu_chats"),
@@ -1049,6 +1581,7 @@ def get_keys_keyboard(user_keys: Dict[str, dict]) -> InlineKeyboardMarkup:
         markup.row(InlineKeyboardButton(f"{mark} {pdata['name_fa']}", callback_data=f"keys_provider:{pkey}"))
     markup.row(InlineKeyboardButton("🟣 سفارشی (سایت دیگر)", callback_data="keys_provider:custom"))
     markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="keys_list"))
+    markup.row(InlineKeyboardButton("🎨 Manus Agent", callback_data="menu_manus"))
     markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
     markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
     return markup
@@ -1066,13 +1599,57 @@ def get_key_provider_detail_keyboard(provider: str, has_key: bool) -> InlineKeyb
         markup.row(InlineKeyboardButton(action, callback_data=f"keys_set:{provider}"))
     if has_key:
         markup.row(InlineKeyboardButton("🗑 حذف کلید", callback_data=f"keys_del:{provider}"))
-        if provider != "custom":
+        if provider == "manus":
+            markup.row(InlineKeyboardButton("🎨 اجرای Manus Agent", callback_data="menu_manus"))
+            markup.row(InlineKeyboardButton("💳 نمایش credits", callback_data="manus_credits"))
+        elif provider != "custom":
             markup.row(
                 InlineKeyboardButton("🤖 استفاده از این سرویس", callback_data=f"set_model_provider:{provider}")
             )
     markup.row(InlineKeyboardButton("🔙 کلیدهای من", callback_data="keys_list"))
     markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
     return markup
+
+
+def get_manus_keyboard() -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
+    markup.row(InlineKeyboardButton("🖼 مثال: ساخت تصویر", callback_data="manus_example_image"))
+    markup.row(InlineKeyboardButton("🔑 کلید Manus", callback_data="keys_provider:manus"))
+    markup.row(InlineKeyboardButton("💳 credits من", callback_data="manus_credits"))
+    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
+    return markup
+
+
+def manus_intro_text(user_id: int) -> str:
+    keys = list_user_keys(user_id)
+    has = "manus" in keys
+    shared = bool(MANUS_SHARED_API_KEY)
+    key_state = (
+        f"🟢 کلید شخصی `{mask_key(keys['manus'].get('api_key',''))}`"
+        if has
+        else ("🟡 کلید مشترک ربات" if shared else "⚪️ کلید ثبت نشده")
+    )
+    return (
+        "🎨 **Manus Agent Mode**\n\n"
+        "این بخش با **API رسمی Manus** کار می‌کند (OpenAI chat نیست).\n"
+        "یک **تسک agent** می‌سازد و نتیجه (متن / فایل / عکس) را در تلگرام می‌فرستد.\n\n"
+        f"**کلید:** {key_state}\n"
+        f"**profile:** `{MANUS_DEFAULT_PROFILE}`\n"
+        f"**timeout:** `{MANUS_TIMEOUT_SEC}s`\n\n"
+        "**نحوه دریافت کلید:**\n"
+        "1. [manus.im](https://manus.im) ثبت‌نام\n"
+        "2. [Settings → Developers](https://manus.im/app#settings/developers)\n"
+        "3. Create API Key → کپی (فقط یک‌بار)\n"
+        "4. در ربات: کلیدهای من → Manus → افزودن کلید\n\n"
+        "**مثال پرامپت تصویر:**\n"
+        "`Generate a flat illustration of a robot holding a Telegram logo, pastel colors`\n\n"
+        "**ویرایش عکس:**\n"
+        "بعد از «اجرای تسک جدید» → **عکس + کپشن** بفرستید\n"
+        "(کپشن = دستور ویرایش)\n\n"
+        "⚠️ محدودیت API: حدود **۱۰ task/دقیقه** + سهمیه credits.\n"
+        "چت معمولی همچنان از Dahl/Groq/… استفاده می‌شود."
+    )
 
 
 def get_chats_keyboard(chats: List[dict], active_id: Optional[str]) -> InlineKeyboardMarkup:
@@ -1362,7 +1939,9 @@ def handle_help(message):
         "• 🔑 کلیدهای من — BYOK (Dahl, Groq, …)\n"
         "• `/clear` — گفتگوی تازه\n"
         "• `/chats` — لیست گفتگوها\n"
-        "• `/settings` — تنظیمات"
+        "• `/settings` — تنظیمات\n"
+        "• `/manus` — دستیار Manus (تصویر/agent)\n"
+        "• `/manus <prompt>` — اجرای مستقیم"
         f"{admin_line}\n\n"
         "پاسخ خام؟ → تنظیمات → فرمت → **HTML**"
     )
@@ -1437,6 +2016,22 @@ def handle_admin(message):
     bot.reply_to(message, admin_stats_text(), reply_markup=get_admin_keyboard(), parse_mode="Markdown")
 
 
+@bot.message_handler(commands=["manus", "agent"])
+def handle_manus_cmd(message):
+    ensure_user(message.from_user)
+    user_id = message.from_user.id
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        run_manus_for_user(
+            message,
+            parts[1].strip(),
+            user_id=user_id,
+            chat_id=message.chat.id,
+        )
+        return
+    bot.reply_to(message, manus_intro_text(user_id), reply_markup=get_manus_keyboard())
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -1448,6 +2043,76 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, text or "", show_alert=alert)
         except Exception:
             pass
+
+    # ----- Manus agent mode -----
+    if data == "menu_manus":
+        answer()
+        bot.edit_message_text(
+            manus_intro_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(),
+        )
+        return
+
+    if data == "manus_run":
+        PENDING[user_id] = {"action": "manus_prompt"}
+        answer()
+        bot.send_message(
+            call.message.chat.id,
+            "🎨 پرامپت **Manus** را بفرستید:\n"
+            "• **فقط متن:** مثلاً `Generate an image of a cat astronaut`\n"
+            "• **عکس + کپشن:** عکس را attach کنید و دستور ویرایش را در کپشن بنویسید\n"
+            "• فایل PDF/عکس به‌همراه متن هم قبول است\n"
+            "لغو: `/cancel`",
+        )
+        return
+
+    if data == "manus_example_image":
+        answer()
+        run_manus_for_user(
+            message=call.message,
+            prompt=(
+                "Generate a high-quality flat illustration for a Telegram AI bot: "
+                "friendly robot, pastel blue background, no text in the image."
+            ),
+            user_id=user_id,
+            chat_id=call.message.chat.id,
+        )
+        return
+
+    if data == "manus_credits":
+        api_key = get_manus_key(user_id)
+        answer()
+        if not api_key:
+            bot.edit_message_text(
+                manus_intro_text(user_id),
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_manus_keyboard(),
+            )
+            return
+        text = manus_credits_text(api_key)
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🔙 Manus", callback_data="menu_manus"))
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "set_model_provider:manus":
+        answer("Manus حالت Agent است — از دکمه 🎨 استفاده کنید", True)
+        bot.edit_message_text(
+            manus_intro_text(user_id),
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(),
+        )
+        return
 
     if data == "menu_main":
         settings = get_user_settings(user_id)
@@ -1833,8 +2498,11 @@ def handle_callbacks(call):
     if data == "menu_help":
         text = (
             "ℹ️ **راهنما**\n\n"
-            "چت · تنظیمات · BYOK · استریم · سهمیه روزانه · گفتگوهای چندگانه\n"
-            "`/settings` `/keys` `/chats` `/clear` `/help`"
+            "• چت عادی: Dahl / Groq / OpenRouter / … (BYOK)\n"
+            "• **🎨 Manus Agent** — تصویر/تحقیق با API رسمی Manus\n"
+            "• `/manus` یا `/manus <prompt>`\n"
+            "• `/settings` `/keys` `/chats` `/clear` `/admin`\n\n"
+            "پاسخ خام؟ → تنظیمات → فرمت → **HTML**"
         )
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu_settings"))
@@ -1854,6 +2522,54 @@ def handle_cancel(message):
     bot.reply_to(message, "عملیات لغو شد.")
 
 
+@bot.message_handler(content_types=["photo", "document"], func=lambda m: True)
+def handle_manus_media(message):
+    """Photo/document support for Manus agent mode."""
+    user_id = message.from_user.id
+    pending = PENDING.get(user_id)
+    caption = (message.caption or "").strip()
+
+    if not pending or pending.get("action") != "manus_prompt":
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🎨 Manus Agent", callback_data="menu_manus"))
+        bot.reply_to(
+            message,
+            "برای ویرایش/تحلیل عکس با **Manus**:\n"
+            "1) `/manus` یا دکمه 🎨\n"
+            "2) **اجرای تسک جدید**\n"
+            "3) **عکس + کپشن** (دستور ویرایش) را بفرستید\n\n"
+            "اگر الان فقط عکس فرستادی و در حالت Manus نیستی، از `/manus` شروع کن.",
+            reply_markup=markup,
+        )
+        return
+
+    PENDING.pop(user_id, None)
+    ensure_user(message.from_user)
+
+    status = bot.reply_to(message, "⏬ دریافت فایل و آماده‌سازی برای Manus…")
+    attachment = extract_media_from_message(message)
+    if not attachment:
+        bot.edit_message_text(
+            "❌ دریافت عکس/فایل از تلگرام ناموفق بود (حجم؟).\n"
+            "عکس کوچک‌تر بفرستید یا فقط متن بفرستید.",
+            chat_id=status.chat.id,
+            message_id=status.message_id,
+        )
+        return
+
+    prompt = caption or (
+        "Edit this image: keep the main subject, improve quality/style, "
+        "and briefly describe what you changed."
+    )
+    run_manus_for_user(
+        message,
+        prompt,
+        user_id=user_id,
+        chat_id=message.chat.id,
+        attachments=[attachment],
+    )
+
+
 def _handle_pending_input(message) -> bool:
     """Return True if pending flow consumed the message."""
     user_id = message.from_user.id
@@ -1862,6 +2578,25 @@ def _handle_pending_input(message) -> bool:
         return False
     action = pending.get("action")
     raw = (message.text or "").strip()
+
+    if action == "manus_prompt":
+        prompt = pending.get("preset") or raw
+        PENDING.pop(user_id, None)
+        if not prompt or not prompt.strip():
+            bot.reply_to(
+                message,
+                "پرامپت خالی است.\n"
+                "متن بفرستید یا **عکس + کپشن** بفرستید.\n"
+                "دوباره: `/manus`",
+            )
+            return True
+        run_manus_for_user(
+            message,
+            prompt.strip(),
+            user_id=user_id,
+            chat_id=message.chat.id,
+        )
+        return True
 
     if action == "rename_chat":
         cid = pending.get("conversation_id")
@@ -1889,6 +2624,14 @@ def _handle_pending_input(message) -> bool:
         if upsert_user_key(user_id, provider, raw, None):
             PENDING.pop(user_id, None)
             pdata = PROVIDERS[provider]
+            if provider == "manus":
+                bot.reply_to(
+                    message,
+                    f"✅ کلید **Manus** ذخیره شد: `{mask_key(raw)}`\n\n"
+                    "از منوی اصلی **🎨 Manus Agent** یا `/manus` استفاده کنید.",
+                    reply_markup=get_main_keyboard(),
+                )
+                return True
             model_id = pdata.get("default_model_id") or ""
             if model_id:
                 set_user_model(user_id, format_model_ref(provider, model_id))

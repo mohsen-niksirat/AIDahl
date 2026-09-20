@@ -1,8 +1,10 @@
-# AIDahl — Telegram AI Bot (Dahl + multi-provider BYOK)
+# AIDahl — Telegram AI Bot (Dahl + multi-provider BYOK + Manus Agent)
 
-OpenAI-compatible Telegram assistant. Users can chat with models from **Dahl Inference**, **OpenRouter**, **Groq**, **Cerebras**, **SiliconFlow**, **Mistral**, **GitHub Models**, or any **custom** endpoint. **BYOK**: each user may register their own free API key so the bot scales beyond one shared quota.
+OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API keys), plus optional **Manus Agent** mode for image/edit/research tasks.
 
-> Docs: [English](#english) · [فارسی](#persian) · [العربية](#arabic) · [Русский](#russian)
+> Docs: [English](#english) · [فارسی](#persian) · [آموزش کامل فارسی](docs/SETUP_FA.md) · [العربية](#arabic) · [Русский](#russian)
+
+**Full setup tutorial (FA):** [docs/SETUP_FA.md](docs/SETUP_FA.md)
 
 ---
 
@@ -10,137 +12,163 @@ OpenAI-compatible Telegram assistant. Users can chat with models from **Dahl Inf
 
 ### Features
 - Multi-turn chat history (configurable context length)
-- **Settings**: pick provider/model, reply format (HTML / Markdown / plain), history size
-- **BYOK**: `/keys` — store personal API keys (masked in UI)
-- **Streaming** replies (live message updates while the model generates)
-- **Daily token quota** per user (shared key and/or own key, via env)
-- **Multiple named conversations** — switch / rename / new chat from the menu
-- **Admin stats** `/admin` — users, tokens, top models (for `ADMIN_TELEGRAM_IDS`)
-- Token usage logged in Supabase (`usage`, `messages`, `conversations`)
+- **Settings**: provider/model, reply format (HTML / Markdown / plain), history size, streaming
+- **BYOK**: `/keys` — Dahl, OpenRouter, Groq, Cerebras, SiliconFlow, Mistral, GitHub Models, custom, **Manus**
+- **Streaming** replies (live Telegram message updates)
+- **Daily token quota** per user
+- **Multiple named conversations** (`/chats`)
+- **Manus Agent mode** (`/manus`) — async tasks via official Manus API v2; text prompts + image/file edit
+- **Admin stats** `/admin`
+- Usage logged in Supabase
 
 ### Stack
 | Piece | Choice |
 |--------|--------|
 | Bot | Python 3.10+, `pyTelegramBotAPI` |
-| HTTP | `httpx` only (128 MB-friendly, no heavy SDKs) |
+| HTTP | `httpx` only (Deployka free ~128 MB friendly) |
 | DB | Supabase PostgreSQL via PostgREST |
-| Models | OpenAI-compatible `POST /v1/chat/completions` (+ stream) |
+| Chat models | OpenAI-compatible `POST /v1/chat/completions` (+ stream) |
+| Manus | REST `https://api.manus.ai/v2` (tasks, not chat completions) |
 
 ### Quick start
-1. Create a Telegram bot with [@BotFather](https://t.me/BotFather) → copy `BOT_TOKEN`
-2. Create a [Supabase](https://supabase.com) project → copy URL + anon/service key
-3. Get a Dahl key: [inference.dahl.global/account](https://inference.dahl.global/account) (allocate pool tokens to the key)
-4. Clone this repo and configure env:
+1. Telegram bot → [@BotFather](https://t.me/BotFather) → `BOT_TOKEN`
+2. [Supabase](https://supabase.com) project → URL + key
+3. Optional shared Dahl key: [inference.dahl.global/account](https://inference.dahl.global/account)
+4. Configure env:
 
 ```bash
 cp .env.example .env
-# fill BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY, DAHL_API_KEY, ADMIN_TELEGRAM_IDS
 ```
 
-5. Run SQL migrations **in order** in Supabase SQL Editor:
+5. Run SQL **in order** in Supabase SQL Editor:
    - `sql/01_user_api_keys.sql`
    - `sql/02_user_settings.sql`
    - `sql/03_phase5.sql`
-6. Install & run:
+6. Run locally:
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-7. **Deployka / Docker free tier**: set the same variables in the platform env UI. `ALLOW_SHARED_KEY` must be present if the host requires it.
+7. **Deployka**: deploy `main.py` + set env (must include `ALLOW_SHARED_KEY` if the host requires it).
 
 ### Bot commands
 | Command | Description |
 |---------|-------------|
 | `/start` | Main menu |
-| `/settings` | Provider, model, reply format, history, chats |
-| `/keys` | Manage API keys (BYOK) |
+| `/settings` | Model, format, stream, history, chats |
+| `/keys` | BYOK key management |
+| `/manus` | Manus agent mode (images/edit/research) |
+| `/manus <prompt>` | Run a Manus task immediately |
 | `/chats` | List / switch / rename conversations |
-| `/newchat` `/clear` | New conversation |
-| `/admin` | Admin dashboard (if your ID is allowed) |
-| `/help` | Help |
-| `/cancel` | Cancel key-entry flow |
+| `/clear` `/newchat` | New conversation context |
+| `/admin` | Admin dashboard |
+| `/help` `/cancel` | Help / cancel pending input |
+
+### Manus agent mode
+Manus is **not** an OpenAI chat provider. The bot:
+1. Calls `POST /v2/task.create` with `x-manus-api-key`
+2. Polls `task.listMessages` until `stopped` / `waiting` / `error`
+3. Sends result text + file/image URLs to Telegram
+
+**Get a key:** [manus.im/app#settings/developers](https://manus.im/app#settings/developers) → Create API Key (shown once).
+
+Optional env: `MANUS_API_KEY` (shared), `MANUS_LOCALE` (empty = omit; do not use invalid codes like `fa`).
+
+Users can send **photo + caption** after “new task” for image edit prompts (inline base64 upload to Manus).
+
+### Capacity (free tier rough estimate)
+
+| Constraint | Typical free limit | Effect |
+|------------|-------------------|--------|
+| Deployka Free Nano | **~128 MB RAM**, 1 container | Python baseline ~30–40 MB; little headroom for concurrent jobs |
+| Bot process | Single container, threaded telebot | OK for light chat; heavy Manus polls hold threads up to `MANUS_TIMEOUT_SEC` |
+| Supabase Free | ~500 MB DB, shared compute, connection limits | PostgREST bursts are usually fine at low QPS; not the first bottleneck |
+| Telegram | Flood limits on send/edit | Streaming edits every ~1.2 s are OK per chat; many chats → rate limits |
+| Dahl / BYOK | Provider-specific | Shared key exhausts fast; **BYOK** spreads load |
+| Manus API | **~10 `task.create`/min per user account** | Concurrent image jobs are the tightest limit |
+
+**Rough concurrent users without crashing (this stack):**
+- **Safe / sustained:** ~**5–10** simultaneous text chats  
+- **Occasional spikes:** ~**15–25** if mostly short messages, streaming OK, few Manus jobs  
+- **With Manus heavy use:** ~**2–5** Manus jobs at once on one key + a few text chats  
+- **Comfortable daily actives:** ~**50–150** light users (not all chatting at the same second)
+
+**Will struggle / risk OOM or queue collapse:** 50+ true simultaneous long streaming chats, or many parallel 90 s Manus tasks on the free Nano box.
+
+**To scale later:** upgrade host RAM/CPU, move bot to a VPS, add a job queue for Manus, put Supabase pooler in front, require BYOK, disable streaming, lower `HISTORY_LIMIT`.
+
+See capacity details (FA): [docs/SETUP_FA.md](docs/SETUP_FA.md)
 
 ### Environment
-See [`.env.example`](.env.example). Important flags:
-- `STREAMING_ENABLED=true|false`
-- `DEFAULT_DAILY_TOKEN_QUOTA` — default daily tokens per user
-- `QUOTA_APPLIES_TO_OWN_KEYS` — apply quota to personal keys too
-- `ADMIN_TELEGRAM_IDS` — comma-separated admin Telegram IDs
-- `ALLOW_SHARED_KEY` — use bot’s Dahl key when user has none
+See [`.env.example`](.env.example). Highlights:
+- `ALLOW_SHARED_KEY`, `STREAMING_ENABLED`, `DEFAULT_DAILY_TOKEN_QUOTA`
+- `QUOTA_APPLIES_TO_OWN_KEYS`, `ADMIN_TELEGRAM_IDS`
+- `MANUS_API_KEY`, `MANUS_LOCALE`, `MANUS_TIMEOUT_SEC`
 
-### Database tables
+### Database
 `users`, `conversations`, `messages`, `usage`, `user_api_keys`, `user_quotas`  
-Schema is created by the SQL files under [`sql/`](sql/).
+SQL under [`sql/`](sql/).
 
-### Security notes
-- Never commit `.env` (gitignored). Rotate keys if they were shared.
-- API keys in the bot are **masked** after save.
-- RLS: bot tables are backend-only; disable RLS or use service key carefully.
-- Multi-account abuse of free provider quotas may violate provider Terms of Service.
+### Security
+- Never commit `.env`. Rotate leaked tokens.
+- Keys stored for BYOK are **masked** in UI.
+- Bot tables are backend-only (RLS disabled or no public policies) — protect `SUPABASE_KEY`.
+- Multi-account farming of free provider quotas may violate provider ToS.
 
 ---
 
 ## Persian
 
 ### امکانات
-- چت چندنوبتی با تاریخچه قابل تنظیم
-- **تنظیمات**: انتخاب سرویس/مدل، فرمت پاسخ (HTML/Markdown/ساده)، اندازه تاریخچه
-- **BYOK**: ثبت کلید API شخصی با `/keys`
-- **استریم** پاسخ (به‌روزرسانی زنده پیام)
-- **سهمیه روزانه توکن** برای هر کاربر
-- **چند گفتگو با نام** — تعویض/تغییر نام/گفتگوی جدید
-- **آمار ادمین** `/admin` — تعداد کاربر، توکن، مدل‌های پرتکرار
+- چت چندنوبتی + استریم پاسخ  
+- تنظیمات: مدل/سرویس، فرمت، تاریخچه  
+- **BYOK** برای Dahl و دیگر سرویس‌ها + **Manus**  
+- **چند گفتگو** با نام (`/chats`)  
+- **سهمیه روزانه** توکن  
+- **Manus Agent** (`/manus`) — ساخت/ویرایش تصویر و تسک agent  
+- **آمار ادمین** (`/admin`)
 
-### راه‌اندازی سریع
-1. ربات بات‌فادر + توکن  
-2. پروژه Supabase + اجرای `sql/01` تا `sql/03` به ترتیب  
-3. کلید Dahl و Allocate از Pool  
-4. `cp .env.example .env` و پر کردن متغیرها  
-5. `pip install -r requirements.txt && python main.py`  
-6. دیپلوی روی Deployka با همان env ها (وجود `ALLOW_SHARED_KEY` الزامی)
+### راه‌اندازی
+راهنمای قدم‌به‌قدم کامل (فارسی):
+
+**[docs/SETUP_FA.md](docs/SETUP_FA.md)**
+
+خلاصه:
+1. BotFather + Supabase + (اختیاری) کلید Dahl/Manus  
+2. اجرای `sql/01` تا `sql/03`  
+3. `.env` / env های Deployka  
+4. `pip install -r requirements.txt && python main.py` یا دیپلوی Deployka  
+
+### ظرفیت تقریبی (رایگان)
+| سناریو | تقریباً |
+|--------|---------|
+| چت متنی همزمان امن | **۵–۱۰ نفر** |
+| اسپایک کوتاه | **۱۵–۲۵** (اگر Manus سنگین نباشد) |
+| چند ویرایش تصویر Manus همزمان | **۲–۵** + چند چت ساده |
+| کاربر فعال روزانه سبک | حدود **۵۰–۱۵۰** (نه همه در یک ثانیه) |
+
+بالاتر از این روی Deployka Nano (۱۲۸MB) ریسک OOM/کندی/ریت‌لیمیت تلگرام بالا می‌رود.  
+برای رشد: ارتقای سرور + صف (queue) برای Manus + BYOK اجباری.
 
 ### دستورات
-`/start` `/settings` `/keys` `/chats` `/clear` `/admin` `/help` `/cancel`
+`/start` `/settings` `/keys` `/manus` `/chats` `/clear` `/admin` `/help`
 
 ---
 
 ## Arabic
 
-### المميزات
-- محادثة متعددة الأدوار مع سياق قابل للضبط
-- **الإعدادات**: مزود/نموذج، تنسيق الرد، حجم السياق
-- **مفاتيح API** الخاصة بالمستخدم (`/keys`)
-- **بث مباشر** للرد أثناء التوليد
-- **حصة يومية** من التوكنات لكل مستخدم
-- **محادثات متعددة** بأسماء
-- **إحصائيات المشرف** عبر `/admin`
-
-### التشغيل
-1. بوت تلغرام + Supabase + مفتاح Dahl  
-2. نفّذ ملفات `sql/01` ثم `02` ثم `03`  
-3. انسخ `.env.example` إلى `.env` واملأ القيم  
-4. `pip install -r requirements.txt` ثم `python main.py`
+راجع التشغيل الكامل بالعربية: استخدم [docs/SETUP_FA.md](docs/SETUP_FA.md) (فارسی) أو اتبع English Quick start أعلاه.  
+تقدير الاستخدام المتزامن على باقة مجانية: حوالي **5–10** محادثات نصية آمنة، و**2–5** مهام Manus متزامنة.
 
 ---
 
 ## Russian
 
-### Возможности
-- Многораундовый чат с настраиваемой историей
-- **Настройки**: провайдер/модель, формат ответа, размер контекста
-- **Свои API-ключи** (`/keys`)
-- **Стриминг** ответов в Telegram
-- **Дневная квота** токенов на пользователя
-- **Несколько именованных диалогов**
-- **Админ-статистика** `/admin`
-
-### Быстрый старт
-1. Токен бота + Supabase + ключ Dahl  
-2. SQL: `sql/01`, `02`, `03` по порядку  
-3. `.env.example` → `.env`  
-4. `pip install -r requirements.txt && python main.py`
+Краткий старт — в разделе English Quick start.  
+Подробная инструкция (перс.): [docs/SETUP_FA.md](docs/SETUP_FA.md).  
+Оценка одновременных пользователей на free-tier: **5–10** текстовых чатов; Manus **2–5** задач параллельно.
 
 ---
 
@@ -148,10 +176,12 @@ Schema is created by the SQL files under [`sql/`](sql/).
 
 ```
 AIDahl/
-├── main.py                 # Bot application
+├── main.py
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
+├── docs/
+│   └── SETUP_FA.md          # Full Persian implementation guide
 ├── sql/
 │   ├── 01_user_api_keys.sql
 │   ├── 02_user_settings.sql
@@ -159,12 +189,11 @@ AIDahl/
 └── README.md
 ```
 
-## License
-Use at your own risk. Respect each inference provider’s terms.
-
----
-
 ## Links
-- Dahl Inference: https://inference.dahl.global  
-- Docs: https://inference.dahl.global/docs/  
+- Dahl: https://inference.dahl.global · Docs: https://inference.dahl.global/docs/  
+- Manus API: https://open.manus.ai/docs  
+- Manus key: https://manus.im/app#settings/developers  
 - Supabase: https://supabase.com  
+
+## License
+Use at your own risk. Respect each provider’s terms.

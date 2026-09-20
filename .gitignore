@@ -5,3 +5,4 @@ __pycache__/
 .Python
 *.zip
 .DS_Store
+*.log
