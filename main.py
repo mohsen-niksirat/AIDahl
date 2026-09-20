@@ -1711,7 +1711,7 @@ def manus_wait_for_task(
         "timed_out": False,
         "task_id": task_id,
     }
-    extra_file_wait = 45  # seconds after stop to catch late-exported images
+    extra_file_wait = 75  # seconds after stop to catch late-exported images
     extra_deadline = None
 
     while time.time() < deadline or (extra_deadline and time.time() < extra_deadline):
@@ -1869,6 +1869,58 @@ def manus_send_file_pair(chat_id: int, content: bytes, name: str, f: dict):
             bot.send_message(chat_id, f"📎 {safe_name}\n{f.get('url')}")
 
 
+_INPUT_FILE_HINTS = (
+    "telegram_photo",
+    "telegram_document",
+    "/input/",
+    "input_image",
+    "source_image",
+    "original_image",
+    "upload",
+    "attachment",
+)
+
+
+def _looks_like_input_file(f: dict) -> bool:
+    name = str(f.get("name") or "").lower()
+    url = str(f.get("url") or "").lower()
+    mime = str(f.get("mime") or "").lower()
+    blob = name + " " + url + " " + mime
+    if "output" in blob or "result" in blob or "edited" in blob or "export" in blob:
+        return False
+    return any(h in blob for h in _INPUT_FILE_HINTS)
+
+
+def _filter_output_files(files: List[dict], had_attachment: bool = False) -> List[dict]:
+    """Keep only likely Manus OUTPUT files; drop user input echoes."""
+    out = []
+    for f in files or []:
+        if not f.get("url"):
+            continue
+        if _looks_like_input_file(f):
+            continue
+        out.append(f)
+    if had_attachment:
+        images = [f for f in out if _is_image_file(f)]
+        others = [f for f in out if not _is_image_file(f)]
+        out = images[:2] + others[:2]
+    else:
+        out = out[:3]
+    return out
+
+
+def _relax_output_files(files: List[dict], exclude: set) -> List[dict]:
+    """If strict filter removed everything, fall back to newest non-delivered files."""
+    cand = [f for f in files or [] if f.get("url") and f.get("url") not in exclude]
+    if not cand:
+        return []
+    # Prefer anything that does not look like telegram input
+    soft = [f for f in cand if not _looks_like_input_file(f)]
+    if soft:
+        return soft[:2]
+    return cand[:2]
+
+
 def manus_deliver_result(
     chat_id: int,
     status_msg,
@@ -1879,30 +1931,33 @@ def manus_deliver_result(
     exclude_urls: Optional[set] = None,
     followup: bool = False,
     user_id: Optional[int] = None,
+    had_attachment: bool = False,
 ) -> List[str]:
-    """Send final Manus output to Telegram — text + NEW photo/file only."""
+    """Send final Manus OUTPUT only — never re-send the user's input image."""
     status = result.get("agent_status") or "?"
     text = (result.get("text") or "").strip()
     exclude = set(exclude_urls or ())
-    files = [f for f in (result.get("files") or []) if f.get("url") not in exclude]
+    raw_files = [f for f in (result.get("files") or []) if f.get("url") not in exclude]
+    files = _filter_output_files(raw_files, had_attachment=had_attachment)
     error = result.get("error")
-    timed_out = result.get("timed_out")
 
-    # last-chance harvest if we have credentials — skip already-delivered URLs
+    # Harvest newest messages only — full task history includes the input image
     if api_key and task_id:
         try:
             more = manus_collect_files(
                 api_key,
                 task_id,
                 exclude_urls=exclude,
-                newest_only=followup,
+                newest_only=True,
             )
+            more = _filter_output_files(more, had_attachment=had_attachment)
             have = {f.get("url") for f in files}
             for f in more:
                 u = f.get("url")
-                if u and u not in have and u not in exclude:
+                if u and u not in have and u not in exclude and not _looks_like_input_file(f):
                     files.append(f)
                     have.add(u)
+            files = _filter_output_files(files, had_attachment=had_attachment)
         except Exception as e:
             logging.warning(f"deliver harvest: {e}")
 
@@ -1910,8 +1965,6 @@ def manus_deliver_result(
 
     if status == "error" or error:
         msg = f"❌ Manus agent خطا داد.\n`{error or status}`"
-        if files:
-            msg += f"\nفایل‌های جدید: {len(files)}"
         if task_url:
             msg += f"\n{task_url}"
         try:
@@ -1923,12 +1976,11 @@ def manus_deliver_result(
             )
         except Exception:
             bot.send_message(chat_id, msg)
-        # still try to deliver any NEW files found
     elif status == "waiting":
         detail = result.get("status_detail") or {}
         waiting_desc = detail.get("waiting_description") or detail.get("waiting_for_event_type") or ""
         msg = (
-            "⏸ Manus در وضعیت **waiting** است (به ورودی/تأیید نیاز دارد).\n"
+            "⏸ Manus در وضعیت **waiting** است.\n"
             f"{waiting_desc}\n\n"
             "برای ادامه در پنل Manus باز کنید."
         )
@@ -1945,16 +1997,13 @@ def manus_deliver_result(
             bot.send_message(chat_id, msg)
         return sent_urls
     else:
-        if followup:
-            final = text or "✅ ادیت Manus تمام شد."
-            if files:
-                final += f"\n\n📦 فایل‌های **جدید** این نوبت: {len(files)}"
-            else:
-                final += "\n\nℹ️ فایل جدیدی در این نوبت پیدا نشد (فقط پاسخ متنی)."
+        if files:
+            final = (text or "✅ خروجی Manus آماده است.") + (
+                f"\n\n📦 خروجی جدید: {len(files)} فایل (فقط نتیجه — عکس ورودی شما دوباره فرستاده نمی‌شود)"
+            )
         else:
             final = text or "✅ Manus task تمام شد."
-            if files:
-                final += f"\n\n📦 فایل‌ها: {len(files)} — preview + فایل اصلی در پیام‌های بعدی"
+            final += "\n\nℹ️ فایل خروجی جدیدی در payload نبود (فقط متن)."
         if task_url:
             final += f"\n\n🔗 {task_url}"
         try:
@@ -1973,29 +2022,22 @@ def manus_deliver_result(
                 bot.send_message(chat_id, truncate_message(final))
 
     if not files:
-        if followup:
-            bot.send_message(
-                chat_id,
-                "ℹ️ نتیجه جدید آمد ولی فایل/عکس **تازه**‌ای برای ارسال نبود.\n"
-                "اگر Manus تصویر تولید کرده، لینک را در task ببینید:\n"
-                f"{task_url or ''}",
-            )
-        else:
-            bot.send_message(
-                chat_id,
-                "⚠️ هیچ URL فایل/عکسی در payload پیدا نشد.\n"
-                f"{task_url or ''}",
-            )
-        logging.warning(
-            f"manus deliver: no NEW files. status={status} task={task_id} "
-            f"followup={followup} excluded={len(exclude)}"
-        )
+        # last chance: any newest file not already delivered
+        if api_key and task_id:
+            try:
+                loose = manus_collect_files(api_key, task_id, exclude_urls=exclude, newest_only=True)
+                loose = _relax_output_files(loose, exclude)
+                if loose:
+                    files = loose
+            except Exception:
+                pass
+    if not files:
         return sent_urls
 
     delivered = 0
-    for f in files[:6]:
+    for f in files[:4]:
         url = f.get("url")
-        if not url or url in exclude:
+        if not url or url in exclude or _looks_like_input_file(f):
             continue
         name = f.get("name") or _filename_from_url(url)
         content = None
@@ -2005,10 +2047,6 @@ def manus_deliver_result(
             content = manus_download_file(url, "")
         if not content:
             logging.warning(f"download failed for {url}")
-            try:
-                bot.send_message(chat_id, f"❌ دانلود فایل ناموفق:\n`{name}`\n{url}")
-            except Exception:
-                pass
             continue
         try:
             manus_send_file_pair(chat_id, content, name, f)
@@ -2016,14 +2054,6 @@ def manus_deliver_result(
             sent_urls.append(url)
         except Exception as e:
             logging.error(f"deliver file pair failed: {e}")
-            try:
-                bot.send_message(chat_id, f"❌ خطا در ارسال `{name}`: {e}")
-            except Exception:
-                pass
-
-    if delivered == 0:
-        links = "\n".join(f"• {f.get('name')}: {f.get('url')}" for f in files[:4])
-        bot.send_message(chat_id, f"فایل دانلود نشد. لینک‌ها:\n{links}")
 
     if user_id and sent_urls:
         manus_mark_delivered(user_id, sent_urls)
@@ -2168,7 +2198,9 @@ def list_user_prompts(user_id: int) -> List[dict]:
             cache = _prompt_cache_load(user_id)
             cache.clear()
             for r in rows:
-                cache[r.get("name") or ""] = r.get("prompt") or ""
+                n = (r.get("name") or "").strip()
+                if n:
+                    cache[n] = r.get("prompt") or ""
     except Exception as e:
         logging.error(f"list_user_prompts: {e}")
         cache = _prompt_cache_load(user_id)
@@ -2176,7 +2208,52 @@ def list_user_prompts(user_id: int) -> List[dict]:
             {"name": n, "prompt": p, "id": None, "updated_at": ""}
             for n, p in cache.items()
         ]
-    return rows
+    # de-dupe by name (keep first)
+    seen = set()
+    uniq = []
+    for r in rows:
+        n = (r.get("name") or "").strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        uniq.append({**r, "name": n})
+    return uniq
+
+
+def find_prompt_by_name(user_id: int, query: str) -> Optional[dict]:
+    """Match saved prompt by exact name only (avoid long captions false-matching)."""
+    q = (query or "").strip()
+    if not q or len(q) > 64:
+        return None
+    rows = list_user_prompts(user_id)
+    for r in rows:
+        if (r.get("name") or "").strip() == q:
+            return {"name": r["name"], "prompt": r.get("prompt") or ""}
+    ql = q.lower()
+    for r in rows:
+        n = (r.get("name") or "").strip()
+        if n.lower() == ql:
+            p = r.get("prompt") or get_saved_prompt(user_id, n)
+            if p:
+                return {"name": n, "prompt": p}
+    return None
+
+
+def get_my_prompts_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("➕ ثبت پرامپت جدید", callback_data="prompt_save_start"))
+    rows = list_user_prompts(user_id)[:12]
+    for r in rows:
+        name = (r.get("name") or "")[:22]
+        # one row per prompt: use | delete (name shown once)
+        markup.row(
+            InlineKeyboardButton(f"📝 {name}", callback_data=f"prompt_use:{(r.get('name') or '')[:40]}"),
+            InlineKeyboardButton("🗑", callback_data=f"prompt_del:{(r.get('name') or '')[:40]}"),
+        )
+    markup.row(InlineKeyboardButton("🎨 Manus با پرامپت سیو شده", callback_data="manus_pick_prompt"))
+    markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu_my_prompts"))
+    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
+    return markup
 
 
 def save_user_prompt(user_id: int, name: str, prompt: str) -> bool:
@@ -2298,22 +2375,6 @@ def get_manus_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     markup.row(InlineKeyboardButton("🔑 کلید Manus", callback_data="keys_provider:manus"))
     markup.row(InlineKeyboardButton("💳 credits من", callback_data="manus_credits"))
     markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
-    markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
-    return markup
-
-
-def get_my_prompts_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    markup = InlineKeyboardMarkup()
-    markup.row(InlineKeyboardButton("➕ ثبت پرامپت جدید", callback_data="prompt_save_start"))
-    rows = list_user_prompts(user_id)[:12]
-    for r in rows:
-        name = (r.get("name") or "")[:28]
-        markup.row(InlineKeyboardButton(f"📝 {name}", callback_data=f"prompt_use:{name[:40]}"))
-    for r in rows[:8]:
-        name = (r.get("name") or "")[:28]
-        markup.row(InlineKeyboardButton(f"🗑 {name}", callback_data=f"prompt_del:{name[:40]}"))
-    markup.row(InlineKeyboardButton("🎨 Manus با پرامپت سیو شده", callback_data="manus_pick_prompt"))
-    markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu_my_prompts"))
     markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
     return markup
 
@@ -2786,11 +2847,14 @@ def _execute_manus_job(job: dict):
             pass
 
     result = manus_wait_for_task(api_key, task_id, on_progress=on_progress)
-    # On follow-up, do not re-send files from previous turns
-    if mode == "followup":
-        result["files"] = [
-            f for f in (result.get("files") or []) if f.get("url") not in exclude
-        ]
+    had_att = bool(attachments)
+    exclude = manus_delivered_urls(user_id) if mode == "followup" else set()
+    raw = [f for f in (result.get("files") or []) if f.get("url") not in exclude]
+    filtered = _filter_output_files(raw, had_attachment=had_att)
+    if not filtered and raw:
+        # strict filter ate the output — deliver newest non-input candidates
+        filtered = _relax_output_files(raw, exclude)
+    result["files"] = filtered
     manus_deliver_result(
         chat_id,
         status_msg,
@@ -2798,9 +2862,10 @@ def _execute_manus_job(job: dict):
         task_url,
         api_key=api_key,
         task_id=task_id,
-        exclude_urls=exclude if mode == "followup" else set(),
+        exclude_urls=exclude,
         followup=(mode == "followup"),
         user_id=user_id,
+        had_attachment=had_att,
     )
 
     # Stay in follow-up mode so the next photo/text continues this task
@@ -3426,6 +3491,8 @@ def handle_clear(message):
     model_ref = get_user_model(user_id)
     try:
         conv = create_conversation(user_id, model_ref, title="گفتگوی جدید")
+        manus_clear_session(user_id)
+        PENDING.pop(user_id, None)
         provider, model_id = parse_model_ref(model_ref)
         bot.reply_to(
             message,
@@ -3433,6 +3500,7 @@ def handle_clear(message):
             f"شناسه: `{str(conv.get('id',''))[:8]}…`\n"
             f"مدل: `{provider}` / `{model_id}`\n\n"
             "🗄 **سیاست ذخیره:** فقط همین گفتگو روی سرور می‌ماند.\n"
+            "🎨 سشن Manus هم ریست شد.\n"
             "گفتگوهای قبلی از دیتابیس پاک شدند؛ چت‌های تلگرام شما دست‌نخورده است.",
         )
     except Exception as e:
@@ -3719,7 +3787,9 @@ def handle_callbacks(call):
 
     if data == "mode_manus":
         set_bot_mode(user_id, BOT_MODE_MANUS)
-        answer("حالت: Manus")
+        # Entering Manus does not force follow-up; new photo = new task
+        PENDING.pop(user_id, None)
+        answer("حالت: Manus — عکس+کپشن = تسک جدید")
         bot.edit_message_text(
             manus_intro_text(user_id) + f"\n\n🎯 حالت: **{mode_fa(BOT_MODE_MANUS)}**",
             call.message.chat.id,
@@ -4137,10 +4207,14 @@ def handle_callbacks(call):
     if data == "chat_new":
         model_ref = get_user_model(user_id)
         conv = create_conversation(user_id, model_ref, title="گفتگوی جدید")
+        # New Telegram chat session → also reset Manus follow-up context
+        manus_clear_session(user_id)
+        PENDING.pop(user_id, None)
         chats = list_conversations(user_id)
         answer("گفتگوی جدید فعال شد", True)
         bot.edit_message_text(
-            chats_overview_text(chats, conv["id"]),
+            chats_overview_text(chats, conv["id"])
+            + "\n\n🎨 سشن Manus هم ریست شد — عکس بعدی = **تسک جدید**.",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=get_chats_keyboard(chats, conv["id"]),
@@ -4378,7 +4452,14 @@ def handle_cancel(message):
 
 @bot.message_handler(content_types=["photo", "document"], func=lambda m: True)
 def handle_manus_media(message):
-    """Photo/document for Manus (or mode guidance for Dahl chat)."""
+    """
+    Photo/document routing:
+    - Explicit follow-up pending → same Manus task
+    - Caption == saved prompt name → NEW Manus task with that stored text
+    - Caption (free text) in Manus mode → NEW Manus task (task.create)
+    - Photo only + picked prompt → NEW Manus task
+    - Otherwise → short guide
+    """
     user_id = message.from_user.id
     pending = PENDING.get(user_id) or {}
     caption = (message.caption or "").strip()
@@ -4391,71 +4472,22 @@ def handle_manus_media(message):
     ensure_user(message.from_user)
     mode = get_bot_mode(user_id)
     pick = get_picked_prompt(user_id)
-
-    # Exclusive chat mode: photos are not processed as Manus
-    if mode == BOT_MODE_CHAT and action not in ("manus_prompt", "manus_followup"):
-        markup = InlineKeyboardMarkup()
-        markup.row(InlineKeyboardButton("🎨 Manus (تصویر)", callback_data="mode_manus"))
-        markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
-        bot.reply_to(
-            message,
-            "🎯 حالت فعلی **چت با دال** است — عکس در این حالت پردازش نمی‌شود.\n\n"
-            "برای ساخت/ویرایش عکس: **🎨 Manus** را بزنید\n"
-            "پرامپت بلند: **📝 پرامپت‌های من** → سپس فقط عکس",
-            reply_markup=markup,
-        )
-        return
-
     status = None
-    try:
-        # Saved prompt + photo (no caption needed)
-        if pick and not caption and action not in ("manus_prompt",):
-            status = bot.reply_to(
-                message,
-                f"⏬ عکس + پرامپت سیو شده **{pick.get('name')}**\nدر حال آماده‌سازی…",
-            )
-            attachment, att_err = extract_media_from_message(message)
-            if not attachment:
-                bot.edit_message_text(
-                    f"❌ دریافت عکس ناموفق بود.\n{att_err}",
-                    chat_id=status.chat.id,
-                    message_id=status.message_id,
-                )
-                return
-            set_bot_mode(user_id, BOT_MODE_MANUS)
-            followup = bool(session) and action == "manus_followup"
-            ok = run_manus_for_user(
-                message,
-                pick.get("prompt") or "",
-                user_id=user_id,
-                chat_id=message.chat.id,
-                attachments=[attachment],
-                followup=followup,
-            )
-            if not ok:
-                bot.edit_message_text(
-                    "❌ ثبت درخواست Manus ناموفق. `/manusdebug`",
-                    chat_id=status.chat.id,
-                    message_id=status.message_id,
-                )
-            return
 
-        # Follow-up on existing Manus task
-        if action == "manus_followup" or (session and mode == BOT_MODE_MANUS and action != "manus_prompt"):
-            status = bot.reply_to(message, "⏬ دریافت فایل برای ادیت در همان گفتگوی Manus…")
+    try:
+        # 1) Explicit follow-up only
+        if action == "manus_followup" and session:
+            status = bot.reply_to(message, "⏬ ادیت در همان گفتگوی Manus…")
             attachment, att_err = extract_media_from_message(message)
             prompt = caption or (pick.get("prompt") if pick else "") or (
-                "Continue from the previous result. Apply a sensible refinement "
-                "and briefly describe the change."
+                "Continue from the previous result and briefly describe the change."
             )
-            if not attachment and not caption and not pick:
-                # empty → Dahl if possible
+            if not attachment and not prompt:
                 bot.edit_message_text(
-                    "کپشن/پرامپت سیو شده ندارید — تلاش با دال…",
+                    "کپشن/پرامپت ندارید.",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
-                _dahl_fallback_reply(message, user_id, note="Manus بدون پرامپت:")
                 return
             ok = run_manus_for_user(
                 message,
@@ -4466,84 +4498,131 @@ def handle_manus_media(message):
                 followup=True,
             )
             if not ok:
-                try:
-                    bot.edit_message_text(
-                        "❌ درخواست Manus ثبت نشد. `/manusdebug`",
-                        chat_id=status.chat.id,
-                        message_id=status.message_id,
-                    )
-                except Exception:
-                    pass
+                bot.edit_message_text(
+                    "❌ ثبت ادیت Manus ناموفق. `/manusdebug`",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
             return
 
-        if action != "manus_prompt":
+        # Caption exactly matches a saved prompt name → NEW task
+        named = find_prompt_by_name(user_id, caption) if caption else None
+        if named and named.get("prompt"):
+            status = bot.reply_to(
+                message,
+                f"⏬ عکس + پرامپت **{named.get('name')}**\n"
+                f"({len(named['prompt'])} کاراکتر) → **تسک جدید Manus**…",
+            )
+            attachment, att_err = extract_media_from_message(message)
+            if not attachment:
+                bot.edit_message_text(
+                    f"❌ دریافت عکس ناموفق.\n{att_err}",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+                return
+            pick_saved_prompt(user_id, named["name"])
+            set_bot_mode(user_id, BOT_MODE_MANUS)
+            PENDING.pop(user_id, None)
+            ok = run_manus_for_user(
+                message,
+                named["prompt"],
+                user_id=user_id,
+                chat_id=message.chat.id,
+                attachments=[attachment],
+                followup=False,
+            )
+            if not ok:
+                bot.edit_message_text(
+                    "❌ ثبت Manus ناموفق. `/manusdebug`",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+            return
+
+        # Chat mode (no saved-name caption): do not run Manus
+        if mode == BOT_MODE_CHAT and action != "manus_prompt":
             markup = InlineKeyboardMarkup()
-            markup.row(InlineKeyboardButton("📝 انتخاب پرامپت سیو شده", callback_data="manus_pick_prompt"))
-            markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
+            markup.row(InlineKeyboardButton("🎨 Manus (تصویر + متن)", callback_data="mode_manus"))
             markup.row(InlineKeyboardButton("💬 چت با دال", callback_data="mode_chat"))
             bot.reply_to(
                 message,
-                "برای Manus:\n"
-                "1) 🎨 Manus یا `/mode manus`\n"
-                "2) **استفاده از پرامپت سیو شده** → نام پرامپت\n"
-                "3) **فقط عکس** بفرستید\n"
-                "یا «اجرای تسک جدید» → عکس + کپشن",
+                "🎯 حالت فعلی **چت با دال** است.\n\n"
+                "برای عکس + متن:\n"
+                "**🎨 Manus** را بزنید، بعد عکس + کپشن بفرستید\n"
+                "یا کپشن = نام پرامپت سیوشده باشد.",
                 reply_markup=markup,
             )
             return
 
-        PENDING.pop(user_id, None)
-        manus_clear_session(user_id)
+        # 2) Manus mode / manus_prompt / photo+caption → NEW task
+        # (NOT auto-followup just because an old session exists)
         set_bot_mode(user_id, BOT_MODE_MANUS)
-
-        status = bot.reply_to(message, "⏬ دریافت فایل و آماده‌سازی برای Manus…")
-        attachment, att_err = extract_media_from_message(message)
-        if not attachment:
-            bot.edit_message_text(
-                f"❌ دریافت عکس/فایل ناموفق بود.\n{att_err}",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
+        PENDING.pop(user_id, None)
+        if action == "manus_prompt" or mode == BOT_MODE_MANUS or caption or pick:
+            manus_clear_session(user_id)  # new task by default
+            status = bot.reply_to(
+                message,
+                "⏬ دریافت عکس + متن → **تسک جدید Manus**…",
             )
-            return
+            attachment, att_err = extract_media_from_message(message)
+            if not attachment:
+                bot.edit_message_text(
+                    f"❌ دریافت عکس ناموفق.\n{att_err}\nعکس کوچک‌تر بفرستید.",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+                return
 
-        prompt = caption or (pick.get("prompt") if pick else "") or (
-            "Edit this image: keep the main subject, improve quality/style, "
-            "and briefly describe what you changed."
-        )
-        if not caption and not pick:
-            bot.edit_message_text(
-                "کپشن ندارید و پرامپت سیو شده هم انتخاب نشده — تلاش با دال…",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
-            )
-            _dahl_fallback_reply(message, user_id, note="عکس بدون پرامپت Manus:")
-            return
+            prompt = caption or (pick.get("prompt") if pick else "") or ""
+            if not prompt:
+                bot.edit_message_text(
+                    "کپشن ندارید و پرامپت سیو شده هم انتخاب نشده.\n"
+                    "کپشن بنویسید یا نام پرامپت سیوشده را در کپشن بگذارید.",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+                return
 
-        try:
-            bot.edit_message_text(
-                f"✅ فایل آماده · پرامپت: `{prompt[:50]}`\nارسال به Manus…",
-                chat_id=status.chat.id,
-                message_id=status.message_id,
-            )
-        except Exception:
-            pass
-        ok = run_manus_for_user(
-            message,
-            prompt,
-            user_id=user_id,
-            chat_id=message.chat.id,
-            attachments=[attachment],
-            followup=False,
-        )
-        if not ok:
             try:
                 bot.edit_message_text(
-                    "❌ درخواست Manus ثبت نشد. `/manusdebug`",
+                    f"✅ عکس آماده · پرامپت ({len(prompt)} کاراکتر)\n"
+                    f"ارسال به Manus (task جدید)…\n`{prompt[:60]}`",
                     chat_id=status.chat.id,
                     message_id=status.message_id,
                 )
             except Exception:
                 pass
+
+            ok = run_manus_for_user(
+                message,
+                prompt,
+                user_id=user_id,
+                chat_id=message.chat.id,
+                attachments=[attachment],
+                followup=False,
+            )
+            if not ok:
+                bot.edit_message_text(
+                    "❌ ثبت درخواست Manus ناموفق. `/manusdebug`",
+                    chat_id=status.chat.id,
+                    message_id=status.message_id,
+                )
+            return
+
+        # Fallback guide
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🎨 حالت Manus", callback_data="mode_manus"))
+        markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
+        markup.row(InlineKeyboardButton("📝 پرامپت سیو شده", callback_data="manus_pick_prompt"))
+        bot.reply_to(
+            message,
+            "برای Manus:\n"
+            "1) **🎨 Manus** را بزنید\n"
+            "2) **عکس + کپشن** بفرستید (متن آزاد یا نام پرامپت سیوشده)\n"
+            "ادامه ادیت فقط پس از پیام نتیجه و با دکمه/پیام بعدی است.",
+            reply_markup=markup,
+        )
     except Exception as e:
         logging.exception(f"handle_manus_media: {e}")
         try:
