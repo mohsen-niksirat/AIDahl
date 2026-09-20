@@ -245,7 +245,41 @@ def today_date_str() -> str:
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_TELEGRAM_IDS
+    if user_id in ADMIN_TELEGRAM_IDS:
+        return True
+    # Also honor users.is_admin column if set in Supabase
+    try:
+        res = sb_get(f"users?telegram_id=eq.{user_id}&select=is_admin")
+        data = res.json() or []
+        if data and bool(data[0].get("is_admin")):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def send_admin_text(chat_id: int, text: str, reply_to_message=None, reply_markup=None):
+    """Send admin panel; Markdown first, then plain fallback (avoid silent fail)."""
+    try:
+        if reply_to_message is not None:
+            bot.reply_to(reply_to_message, text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode="Markdown")
+        return
+    except Exception as e:
+        logging.warning(f"admin Markdown send failed: {e}")
+    plain = text.replace("**", "").replace("`", "")
+    try:
+        if reply_to_message is not None:
+            bot.reply_to(reply_to_message, plain, reply_markup=reply_markup)
+        else:
+            bot.send_message(chat_id, plain, reply_markup=reply_markup)
+    except Exception as e:
+        logging.error(f"admin plain send failed: {e}")
+        try:
+            bot.send_message(chat_id, "❌ خطا در ارسال آمار ادمین. لاگ سرور را چک کنید.")
+        except Exception:
+            pass
 
 
 def supabase_headers() -> dict:
@@ -3009,7 +3043,7 @@ def admin_stats_text() -> str:
         f"فعال امروز: `{active_today}`\n"
         f"گفتگوها (فقط فعلی‌ها): `{total_chats}`\n"
         f"کاربران با ردیف سهمیه: `{quota_users}`\n\n"
-        f"**سهمیه‌ها (user_quotas)**\n"
+        f"**سهمیه‌ها**\n"
         f"مصرف کلی همه: `{life_used:,}`\n"
         f"سقف کلی همه: `{life_lim:,}`\n"
         f"مصرف امروز (شمارنده): `{today_q:,}`\n"
@@ -3021,7 +3055,9 @@ def admin_stats_text() -> str:
         f"**کلیدهای BYOK:** {key_line}\n"
         f"سهمیه روزانه روی کلید شخصی: `{'بله' if QUOTA_APPLIES_TO_OWN_KEYS else 'خیر'}`\n"
         f"استریم: `{'روشن' if STREAMING_ENABLED else 'خاموش'}`\n"
-        f"کلید مشترک Dahl: `{'ست‌شده' if DAHL_API_KEY else '—'}`"
+        f"کلید مشترک Dahl: `{'ست‌شده' if DAHL_API_KEY else '—'}`\n"
+        f"نسخه ربات: `{BOT_VERSION}`\n"
+        f"شناسه‌های ادمین (env): `{','.join(str(x) for x in sorted(ADMIN_TELEGRAM_IDS)) or '—'}`"
     )
 
 
@@ -3174,10 +3210,37 @@ def handle_clear(message):
 @bot.message_handler(commands=["admin"])
 def handle_admin(message):
     user_id = message.from_user.id
-    if not is_admin(user_id):
-        bot.reply_to(message, "⛔️ دسترسی ادمین ندارید.\n`ADMIN_TELEGRAM_IDS` را در env تنظیم کنید.")
-        return
-    bot.reply_to(message, admin_stats_text(), reply_markup=get_admin_keyboard(), parse_mode="Markdown")
+    try:
+        if not is_admin(user_id):
+            env_ids = ",".join(str(x) for x in sorted(ADMIN_TELEGRAM_IDS)) or "—"
+            bot.reply_to(
+                message,
+                "⛔️ دسترسی ادمین ندارید.\n\n"
+                f"آیدی شما: `{user_id}`\n"
+                f"ADMIN_TELEGRAM_IDS روی سرور: `{env_ids}`\n\n"
+                "در Deployka آیدی عددی خود را در env اضافه کنید:\n"
+                "`ADMIN_TELEGRAM_IDS=YOUR_ID`\n"
+                "سپس سرویس را ری‌استارت کنید.",
+                parse_mode="Markdown",
+            )
+            return
+        try:
+            text = admin_stats_text()
+        except Exception as e:
+            logging.exception(f"admin_stats_text: {e}")
+            text = f"❌ خطا در ساخت آمار ادمین:\n`{str(e)[:300]}`"
+        send_admin_text(
+            message.chat.id,
+            text,
+            reply_to_message=message,
+            reply_markup=get_admin_keyboard(),
+        )
+    except Exception as e:
+        logging.exception(f"handle_admin: {e}")
+        try:
+            bot.reply_to(message, f"❌ خطای /admin:\n`{str(e)[:250]}`")
+        except Exception:
+            pass
 
 
 @bot.message_handler(commands=["manus", "agent"])
@@ -3440,13 +3503,29 @@ def handle_callbacks(call):
         if not is_admin(user_id):
             answer("دسترسی ندارید", True)
             return
-        bot.edit_message_text(
-            admin_stats_text(),
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=get_admin_keyboard(),
-            parse_mode="Markdown",
-        )
+        try:
+            text = admin_stats_text()
+        except Exception as e:
+            text = f"❌ خطا در آمار:\n`{str(e)[:250]}`"
+        try:
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=get_admin_keyboard(),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logging.warning(f"admin_refresh markdown: {e}")
+            try:
+                bot.edit_message_text(
+                    text.replace("**", "").replace("`", ""),
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=get_admin_keyboard(),
+                )
+            except Exception as e2:
+                logging.error(f"admin_refresh plain: {e2}")
         answer()
         return
 
