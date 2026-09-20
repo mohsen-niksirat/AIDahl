@@ -36,20 +36,40 @@
 2. `/newbot`  
 3. نام نمایشی + یوزرنیم (مثلاً `MyAIDahlAssistantBot`)  
 4. **توکن** (`BOT_TOKEN`) را کپی کن — لوگو نده  
-5. (بعد از دیپلوی) `/setcommands` و متن زیر را بگذار:
+5. (بعد از دیپلوی) `/setcommands` و متن زیر را بگذارد:
 
 ```text
 start - شروع و منوی اصلی
-settings - تنظیمات (مدل، فرمت، استریم)
-manus - دستیار Manus (تصویر/agent)
-chats - لیست گفتگوها
-keys - کلیدهای API شخصی
-clear - گفتگوی جدید
+help - راهنما
+settings - تنظیمات (مدل، فرمت، استریم، تاریخچه)
+keys - کلیدهای API شخصی (BYOK)
+setkey - همان keys — ثبت کلید
+byok - همان keys
+manus - دستیار Manus (تصویر/ویرایش/agent)
+agent - همان manus
+manusqueue - وضعیت صف Manus
+queue - همان manusqueue
+manusreset - پاک‌سازی قفل/صف Manus
+manusdebug - عیب‌یابی Manus
+prompts - پرامپت‌های آماده (مرورگر)
+promptopia - همان prompts
+gallery - همان prompts
+chats - لیست و تعویض گفتگوها
+chatlist - همان chats
+clear - گفتگوی جدید (ریست context)
 newchat - همان clear
 admin - آمار ادمین
-help - راهنما
-cancel - لغو عملیات
+cancel - لغو عملیات جاری
 ```
+
+**`/setdescription` (اختیاری):**
+```text
+دستیار هوش مصنوعی تلگرام — چت، BYOK، استریم، Manus Agent، پرامپت آماده.
+/start · /keys · /manus · /prompts
+کد: github.com/mohsen-niksirat/AIDahl
+```
+
+سیاست حریم خصوصی: [privacy_policy.md](../privacy_policy.md) در ریپو.
 
 ---
 
@@ -59,7 +79,7 @@ cancel - لغو عملیات
 2. **Project Settings → API**  
    - `SUPABASE_URL` مثلاً `https://xxxx.supabase.co`  
    - `SUPABASE_KEY` (anon یا service_role — برای backend معمولاً service_role؛ مراقب باش لو نرود)  
-3. **SQL Editor** → New query → هر سه فایل را **به ترتیب** Run کن:
+3. **SQL Editor** → New query → فایل‌های SQL را **به ترتیب** Run کن: `01` تا `04`
 
 ### sql/01_user_api_keys.sql
 ```sql
@@ -249,63 +269,52 @@ MANUS_API_KEY=<اختیاری>
 
 ### مفهوم
 Manus **API چت OpenAI نیست**. ربات:
-1. `POST https://api.manus.ai/v2/task.create` با هدر `x-manus-api-key`  
-2. Poll: `GET /v2/task.listMessages?task_id=…`  
-3. وقتی `agent_status` شد `stopped` → متن + لینک فایل/عکس به تلگرام  
+1. `POST https://api.manus.ai/v2/task.create` (گفتگوی جدید)  
+2. یا `POST .../v2/task.sendMessage` (ادامه **همان** task — ادیت بعدی)  
+3. Poll: `GET /v2/task.listMessages` + اسکن عمیق فایل‌ها  
+4. دانلود فایل **با هدر** `x-manus-api-key`  
+5. ارسال به تلگرام: **متن + عکس preview + فایل اصلی**  
 
-### ساخت عکس (فقط پرامپت متنی)
+**ساخت عکس:**
 ```text
 /manus Generate a flat illustration of a friendly robot, pastel colors
 ```
 
-### ویرایش عکس (عکس + کپشن)
-1. `/manus` یا دکمه 🎨  
-2. **🚀 اجرای تسک جدید**  
-3. عکس را attach کن + در **کپشن** دستور ویرایش را بنویس  
-   مثال: `این عکس را ویرایش کن: پس‌زمینه ساده و ملایم`
+**ویرایش عکس:** بعد از «اجرای تسک جدید» → عکس + کپشن
 
-ربات فایل را از تلگرام دانلود و به‌صورت base64 به Manus می‌دهد (`file_data`).  
-حجم عملی: تا حدود **۸MB**.
+**ادامه در همان گفتگو:** پس از نتیجه، عکس/متن بعدی را بفرستید — `task.sendMessage` روی همان task.
+
+**صف:** حداکثر `MANUS_MAX_CONCURRENT` (پیش‌فرض ۲) اجرای همزمان؛ بقیه در صف.  
+**قفل گیر کرده:** `/manusreset` · **عیب‌یابی:** `/manusdebug`
+
+**مهم:** `locale: fa` را API قبول نمی‌کند — `MANUS_LOCALE` را خالی بگذار.
+
+### env مرتبط
+```text
+MANUS_API_KEY=
+MANUS_DEFAULT_PROFILE=standard
+MANUS_TIMEOUT_SEC=90
+MANUS_POLL_INTERVAL=4
+MANUS_LOCALE=
+MANUS_MAX_CONCURRENT=2
+MANUS_QUEUE_MAX=15
+MANUS_MAX_PER_USER=1
+MANUS_FOLLOWUP_TTL_SEC=7200
+MANUS_STALE_LOCK_SEC=180
+PROMPTOPIA_URL=https://mohsen-niksirat.github.io/promptopia/
+```
 
 ### خطاهای رایج Manus
 | پیام | معنی |
 |------|------|
-| `invalid locale` | قبلاً `fa` می‌رفت — **رفع شد**؛ کد جدید را دیپلوی کن |
-| `unauthenticated` / 401 | کلید اشتباه/باطل |
-| `rate_limited` / 429 | بیشتر از ~۱۰ task/دقیقه |
-| credit | سهمیه تمام — پنل Manus |
-| waiting | agent به تأیید نیاز دارد — لینک task را باز کن |
-| timeout | طولانی؛ `MANUS_TIMEOUT_SEC` را زیاد کن یا بعداً در پنل چک کن |
-
-### env مرتبط
-```text
-MANUS_API_KEY=          # کلید مشترک (اختیاری)
-MANUS_DEFAULT_PROFILE=standard   # standard|lite|max
-MANUS_TIMEOUT_SEC=90
-MANUS_POLL_INTERVAL=4
-MANUS_LOCALE=           # خالی بهتر؛ یا en
-MANUS_MAX_CONCURRENT=2  # همزمانی واقعی روی سرور رایگان
-MANUS_QUEUE_MAX=15      # سقف صف
-MANUS_MAX_PER_USER=1    # هر کاربر فقط یک درخواست فعال/در صف
-```
-
-### صف همزمانی (مهم روی Deployka Nano)
-اگر چند نفر همزمان `/manus` بزنند:
-- فقط **N=2** (پیش‌فرض) اجرا همزمان می‌شوند  
-- بقیه پیام **«در صف — نوبت شما K»** می‌گیرند  
-- هر کاربر فقط **یک** درخواست فعال/در صف  
-- وضعیت: `/manusqueue` یا دکمه «📊 وضعیت صف»  
-
-**چرا صف؟** سرور رایگان ~128MB RAM نمی‌کشد ۱۰ agent همزمان (poll + دانلود عکس). صف جلوی شات‌داون را می‌گیرد؛ سرعت هر نفر پایین می‌آید ولی سرویس می‌ایستد.
-
-**تخمین ۱۰ نفر همزمان با کلید شخصی:**
-| حالت | ریسک |
-|------|------|
-| بدون صف، ۱۰ اجرا همزمان | **بالا** — OOM / ری‌استارت / صف تلگرام |
-| با صف `MAX_CONCURRENT=2` | **کم** — ۲ نفر کار می‌کنند، ۸ نفر منتظر |
-| کلید شخصی Manus | لود API جدا است؛ **RAM ربات** همچنان مشترک |
-
-کاربران هم می‌توانند کلید شخصی Manus ثبت کنند (BYOK) تا سهمیه مشترک تمام نشود.
+| `invalid locale` | کد قدیمی — نسخه جدید locale نمی‌فرستد |
+| `cannot access local variable '_MANUS_ACTIVE'` | باگ `global` — نسخه جدید را دیپلوی کن |
+| گیر روی «دریافت فایل» | `/manusdebug` + `/manusreset` |
+| `unauthenticated` / 401 | کلید نامعتبر |
+| `rate_limited` / 429 | ~۱۰ task/دقیقه |
+| credit | سهمیه تمام |
+| waiting | agent به تأیید نیاز دارد |
+| عکس در سایت هست ولی در تلگرام نیست | دانلود auth یا پارسر فایل — نسخه جدید deep harvest + download with key |
 
 ---
 
@@ -437,8 +446,14 @@ update public.user_quotas
 
 ## چک‌لیست نهایی
 
-- [ ] `BOT_TOKEN` از BotFather  
-- [ ] Supabase + SQL 01, 02, 03  
+- [ ] SQL 01 و 02 و 03 و **04** (`sql/04_storage_lifetime.sql`)
+- [ ] `DEFAULT_LIFETIME_TOKEN_QUOTA` در Deployka (مثلاً 3000000)
+- [ ] `main.py` جدید دیپلوی شده (باگ `global _MANUS_ACTIVE` و صف Manus)
+- [ ] `/setcommands` کامل BotFather
+- [ ] `/manusdebug` سالم باشد (کلید + ping)
+- [ ] تست `/manus` + عکس/کپشن
+- [ ] تست `/prompts` (باز شدن Promptopia)
+- [ ] لینک privacy در صورت نیاز: `privacy_policy.md`- [ ] Supabase + SQL 01, 02, 03  
 - [ ] `DAHL_API_KEY` (Allocate از Pool)  
 - [ ] `ADMIN_TELEGRAM_IDS`  
 - [ ] `.env` یا env های Deployka کامل  

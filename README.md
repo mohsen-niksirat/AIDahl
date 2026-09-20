@@ -4,7 +4,9 @@ OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API ke
 
 > Docs: [English](#english) · [فارسی](#persian) · [آموزش کامل فارسی](docs/SETUP_FA.md) · [العربية](#arabic) · [Русский](#russian)
 
-**Full setup tutorial (FA):** [docs/SETUP_FA.md](docs/SETUP_FA.md)
+**Full setup tutorial (FA):** [docs/SETUP_FA.md](docs/SETUP_FA.md)  
+**Privacy:** [privacy_policy.md](privacy_policy.md)  
+**Prompts gallery:** https://mohsen-niksirat.github.io/promptopia/
 
 ---
 
@@ -15,11 +17,12 @@ OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API ke
 - **Settings**: provider/model, reply format (HTML / Markdown / plain), history size, streaming
 - **BYOK**: `/keys` — Dahl, OpenRouter, Groq, Cerebras, SiliconFlow, Mistral, GitHub Models, custom, **Manus**
 - **Streaming** replies (live Telegram message updates)
-- **Daily token quota** per user
-- **Multiple named conversations** (`/chats`)
-- **Manus Agent mode** (`/manus`) — async tasks via official Manus API v2; text prompts + image/file edit
+- **Lifetime + daily token quotas** with near-limit warnings
+- **Storage hygiene**: only the **active** conversation stays in Supabase; new chat purges old server-side history
+- **Manus Agent** (`/manus`) — create/edit images via official Manus API v2; **multi-turn follow-up** on the same task; **concurrency queue** for free-tier RAM
+- **Promptopia** button — open ready-made prompts in the browser (`/prompts`)
 - **Admin stats** `/admin`
-- Usage logged in Supabase
+- **Debug tools**: `/manusdebug`, `/manusreset`
 
 ### Stack
 | Piece | Choice |
@@ -28,7 +31,7 @@ OpenAI-compatible Telegram assistant with **BYOK** (users bring their own API ke
 | HTTP | `httpx` only (Deployka free ~128 MB friendly) |
 | DB | Supabase PostgreSQL via PostgREST |
 | Chat models | OpenAI-compatible `POST /v1/chat/completions` (+ stream) |
-| Manus | REST `https://api.manus.ai/v2` (tasks, not chat completions) |
+| Manus | REST `https://api.manus.ai/v2` (`task.create` / `task.sendMessage` / poll) |
 
 ### Quick start
 1. Telegram bot → [@BotFather](https://t.me/BotFather) → `BOT_TOKEN`
@@ -44,6 +47,7 @@ cp .env.example .env
    - `sql/01_user_api_keys.sql`
    - `sql/02_user_settings.sql`
    - `sql/03_phase5.sql`
+   - `sql/04_storage_lifetime.sql`
 6. Run locally:
 
 ```bash
@@ -51,43 +55,49 @@ pip install -r requirements.txt
 python main.py
 ```
 
-7. **Deployka**: deploy `main.py` + set env (must include `ALLOW_SHARED_KEY` if the host requires it).
+7. **Deployka**: deploy `main.py` + set env (include `ALLOW_SHARED_KEY` if the host requires it).  
+8. BotFather `/setcommands` — see [docs/SETUP_FA.md](docs/SETUP_FA.md) §2 for the full list.
 
-### Bot commands
-| Command | Description |
-|---------|-------------|
-| `/start` | Main menu |
-| `/settings` | Model, format, stream, history, chats |
-| `/keys` | BYOK key management |
-| `/manus` | Manus agent mode (images/edit/research) |
-| `/manus <prompt>` | Run a Manus task immediately |
-| `/chats` | List / switch / rename conversations |
-| `/clear` `/newchat` | New conversation context |
-| `/admin` | Admin dashboard |
-| `/help` `/cancel` | Help / cancel pending input |
+### Bot commands (BotFather `/setcommands`)
+```text
+start - شروع و منوی اصلی
+help - راهنما
+settings - تنظیمات (مدل، فرمت، استریم، تاریخچه)
+keys - کلیدهای API شخصی (BYOK)
+setkey - همان keys — ثبت کلید
+byok - همان keys
+manus - دستیار Manus (تصویر/ویرایش/agent)
+agent - همان manus
+manusqueue - وضعیت صف Manus
+queue - همان manusqueue
+manusreset - پاک‌سازی قفل/صف Manus
+manusdebug - عیب‌یابی Manus
+prompts - پرامپت‌های آماده (مرورگر)
+promptopia - همان prompts
+gallery - همان prompts
+chats - لیست و تعویض گفتگوها
+chatlist - همان chats
+clear - گفتگوی جدید (ریست context)
+newchat - همان clear
+admin - آمار ادمین
+cancel - لغو عملیات جاری
+```
 
 ### Manus agent mode
 Manus is **not** an OpenAI chat provider. The bot:
-1. Calls `POST /v2/task.create` with `x-manus-api-key`
-2. Polls `task.listMessages` until `stopped` / `waiting` / `error`
-3. Sends result text + file/image URLs to Telegram
+1. `POST /v2/task.create` (new chat) or `POST /v2/task.sendMessage` (follow-up on same task)
+2. Polls `task.listMessages` (+ deep file harvest + task.detail)
+3. Downloads media **with** `x-manus-api-key` and sends **photo preview + original file** to Telegram
 
 **Get a key:** [manus.im/app#settings/developers](https://manus.im/app#settings/developers) → Create API Key (shown once).
 
-Optional env: `MANUS_API_KEY` (shared), `MANUS_LOCALE` (empty = omit; do not use invalid codes like `fa`).
+**Follow-up edits:** after each result, send the next photo/text — it continues the **same** Manus task (not a new chat). `/manus` → new task; buttons to end follow-up mode.
 
-Users can send **photo + caption** after “new task” for image edit prompts (inline base64 upload to Manus).
+**Queue:** `MANUS_MAX_CONCURRENT` (default 2) + wait queue so free-tier Nano does not OOM. Status: `/manusqueue`. Stuck locks: `/manusreset`.
 
-### Capacity (free tier rough estimate)
+**Env:** `MANUS_API_KEY` (optional shared), `MANUS_LOCALE` (leave empty; **do not** send invalid codes like `fa`), `MANUS_TIMEOUT_SEC`, `MANUS_FOLLOWUP_TTL_SEC`, `MANUS_STALE_LOCK_SEC`.
 
-| Constraint | Typical free limit | Effect |
-|------------|-------------------|--------|
-| Deployka Free Nano | **~128 MB RAM**, 1 container | Python baseline ~30–40 MB; little headroom for concurrent jobs |
-| Bot process | Single container, threaded telebot | OK for light chat; heavy Manus polls hold threads up to `MANUS_TIMEOUT_SEC` |
-| Supabase Free | ~500 MB DB, shared compute, connection limits | **Hygiene policy keeps DB small** — only active conversation kept; usage table not written by default |
-| Telegram | Flood limits on send/edit | Streaming edits every ~1.2 s are OK per chat; many chats → rate limits |
-| Dahl / BYOK | Provider-specific | Shared key exhausts fast; **BYOK** spreads load |
-| Manus API | **~10 `task.create`/min per user account** + queue on bot | `MANUS_MAX_CONCURRENT` (default 2) + wait queue |
+Users can send **photo + caption** for image edit prompts (inline base64 to Manus).
 
 ### Storage policy (DB hygiene)
 - **Only the current conversation** (last ~40 messages) stays in Supabase.
@@ -95,92 +105,65 @@ Users can send **photo + caption** after “new task” for image edit prompts (
 - Telegram chat history is **not** deleted — it stays in the user’s Telegram app.
 - `usage` table is **not written** by default (`SKIP_USAGE_TABLE=true`); quotas live in `user_quotas`.
 - **Lifetime token cap** per user (default **3,000,000**) + warn at **75%** (`LIFETIME_WARN_PCT`).
-- Daily shared-key quota remains (default 50k/day).
+- Daily shared-key quota remains (default 50k/day). Lifetime cap applies to all users.
 
 Run SQL: `sql/03_phase5.sql` then `sql/04_storage_lifetime.sql`.
 
-### Rough concurrency
-- **Safe / sustained:** ~**5–10** simultaneous text chats  
-- **Occasional spikes:** ~**15–25** if mostly short messages, streaming OK, few Manus jobs  
-- **With Manus heavy use:** ~**2–5** Manus jobs at once on one key + a few text chats  
-- **Comfortable daily actives:** ~**50–150** light users (not all chatting at the same second)
+### Capacity (free tier rough estimate)
 
-**Will struggle / risk OOM or queue collapse:** 50+ true simultaneous long streaming chats, or many parallel 90 s Manus tasks on the free Nano box.
+| Constraint | Typical free limit | Effect |
+|------------|-------------------|--------|
+| Deployka Free Nano | **~128 MB RAM**, 1 container | Baseline ~30–40 MB; Manus queue required |
+| Supabase Free | ~500 MB DB | Hygiene policy keeps DB small |
+| Manus API | ~**10 task.create/min** per account | Bot queue + per-user 1 job |
+| Telegram | Flood limits | Streaming OK per chat |
 
-**To scale later:** upgrade host RAM/CPU, move bot to a VPS, add a job queue for Manus, put Supabase pooler in front, require BYOK, disable streaming, lower `HISTORY_LIMIT`.
+**Rough concurrency:** ~**5–10** simultaneous text chats safe; ~**2–5** Manus jobs at once with queue; ~**50–150** light daily actives.
 
 See capacity details (FA): [docs/SETUP_FA.md](docs/SETUP_FA.md)
 
 ### Environment
-See [`.env.example`](.env.example). Highlights:
-- `ALLOW_SHARED_KEY`, `STREAMING_ENABLED`, `DEFAULT_DAILY_TOKEN_QUOTA`
-- `DEFAULT_LIFETIME_TOKEN_QUOTA` (default 3M), `LIFETIME_WARN_PCT` (75)
-- `KEEP_MESSAGES_IN_ACTIVE_CHAT`, `SKIP_USAGE_TABLE`
-- `QUOTA_APPLIES_TO_OWN_KEYS`, `ADMIN_TELEGRAM_IDS`
-- `MANUS_API_KEY`, `MANUS_MAX_CONCURRENT`, `MANUS_TIMEOUT_SEC`
+See [`.env.example`](.env.example).
 
 ### Database
 `users`, `conversations` (active only), `messages` (trimmed), `user_api_keys`, `user_quotas`  
-SQL under [`sql/`](sql/) — run `01` → `02` → `03` → `04`.
+SQL: `sql/01` → `02` → `03` → `04`.
 
 ### Security
 - Never commit `.env`. Rotate leaked tokens.
-- Keys stored for BYOK are **masked** in UI.
-- Bot tables are backend-only (RLS disabled or no public policies) — protect `SUPABASE_KEY`.
-- Multi-account farming of free provider quotas may violate provider ToS.
+- BYOK keys are **masked** in UI.
+- Bot tables are backend-only — protect `SUPABASE_KEY`.
+- Multi-account farming of free quotas may violate provider ToS.
+- Privacy: [privacy_policy.md](privacy_policy.md)
 
 ---
 
 ## Persian
 
 ### امکانات
-- چت چندنوبتی + استریم پاسخ  
-- تنظیمات: مدل/سرویس، فرمت، تاریخچه  
-- **BYOK** برای Dahl و دیگر سرویس‌ها + **Manus**  
-- **چند گفتگو** با نام (`/chats`)  
-- **سهمیه روزانه** توکن  
-- **Manus Agent** (`/manus`) — ساخت/ویرایش تصویر و تسک agent  
-- **آمار ادمین** (`/admin`)
+- چت چندنوبتی + استریم  
+- **BYOK** + **Manus** (تصویر/ادیت) + **صف همزمانی**  
+- **ادامه ادیت در همان گفتگوی Manus**  
+- **سهمیه کلی + روزانه** با هشدار  
+- **فقط گفتگوی فعلی** روی سرور (پاک‌سازی با چت جدید)  
+- **پرامپت‌های آماده** (`/prompts`)  
+- `/manusdebug` `/manusreset`  
 
 ### راه‌اندازی
-راهنمای قدم‌به‌قدم کامل (فارسی):
-
-**[docs/SETUP_FA.md](docs/SETUP_FA.md)**
-
-خلاصه:
-1. BotFather + Supabase + (اختیاری) کلید Dahl/Manus  
-2. اجرای `sql/01` تا `sql/03`  
-3. `.env` / env های Deployka  
-4. `pip install -r requirements.txt && python main.py` یا دیپلوی Deployka  
-
-### ظرفیت تقریبی (رایگان)
-| سناریو | تقریباً |
-|--------|---------|
-| چت متنی همزمان امن | **۵–۱۰ نفر** |
-| اسپایک کوتاه | **۱۵–۲۵** (اگر Manus سنگین نباشد) |
-| چند ویرایش تصویر Manus همزمان | **۲–۵** + چند چت ساده |
-| کاربر فعال روزانه سبک | حدود **۵۰–۱۵۰** (نه همه در یک ثانیه) |
-
-بالاتر از این روی Deployka Nano (۱۲۸MB) ریسک OOM/کندی/ریت‌لیمیت تلگرام بالا می‌رود.  
-برای رشد: ارتقای سرور + صف (queue) برای Manus + BYOK اجباری.
+**[docs/SETUP_FA.md](docs/SETUP_FA.md)** — SQL 01 تا 04 + BotFather + Deployka  
 
 ### دستورات
-`/start` `/settings` `/keys` `/manus` `/chats` `/clear` `/admin` `/help`
+`/start` `/settings` `/keys` `/manus` `/prompts` `/chats` `/clear` `/admin` `/manusdebug`
 
 ---
 
 ## Arabic
-
-راجع التشغيل الكامل بالعربية: استخدم [docs/SETUP_FA.md](docs/SETUP_FA.md) (فارسی) أو اتبع English Quick start أعلاه.  
-تقدير الاستخدام المتزامن على باقة مجانية: حوالي **5–10** محادثات نصية آمنة، و**2–5** مهام Manus متزامنة.
-
----
+Quick start: English Quick start + SQL `01`–`04`. Full guide (FA): [docs/SETUP_FA.md](docs/SETUP_FA.md).  
+Privacy: [privacy_policy.md](privacy_policy.md).
 
 ## Russian
-
-Краткий старт — в разделе English Quick start.  
-Подробная инструкция (перс.): [docs/SETUP_FA.md](docs/SETUP_FA.md).  
-Оценка одновременных пользователей на free-tier: **5–10** текстовых чатов; Manus **2–5** задач параллельно.
+Quick start: см. English. SQL `01`–`04`. Guide (FA): [docs/SETUP_FA.md](docs/SETUP_FA.md).  
+Privacy: [privacy_policy.md](privacy_policy.md).
 
 ---
 
@@ -192,19 +175,21 @@ AIDahl/
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
+├── privacy_policy.md
 ├── docs/
-│   └── SETUP_FA.md          # Full Persian implementation guide
+│   └── SETUP_FA.md
 ├── sql/
 │   ├── 01_user_api_keys.sql
 │   ├── 02_user_settings.sql
-│   └── 03_phase5.sql
+│   ├── 03_phase5.sql
+│   └── 04_storage_lifetime.sql
 └── README.md
 ```
 
 ## Links
 - Dahl: https://inference.dahl.global · Docs: https://inference.dahl.global/docs/  
-- Manus API: https://open.manus.ai/docs  
-- Manus key: https://manus.im/app#settings/developers  
+- Manus API: https://open.manus.ai/docs · Key: https://manus.im/app#settings/developers  
+- Prompts: https://mohsen-niksirat.github.io/promptopia/  
 - Supabase: https://supabase.com  
 
 ## License
