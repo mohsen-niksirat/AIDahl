@@ -84,12 +84,22 @@ Users can send **photo + caption** after “new task” for image edit prompts (
 |------------|-------------------|--------|
 | Deployka Free Nano | **~128 MB RAM**, 1 container | Python baseline ~30–40 MB; little headroom for concurrent jobs |
 | Bot process | Single container, threaded telebot | OK for light chat; heavy Manus polls hold threads up to `MANUS_TIMEOUT_SEC` |
-| Supabase Free | ~500 MB DB, shared compute, connection limits | PostgREST bursts are usually fine at low QPS; not the first bottleneck |
+| Supabase Free | ~500 MB DB, shared compute, connection limits | **Hygiene policy keeps DB small** — only active conversation kept; usage table not written by default |
 | Telegram | Flood limits on send/edit | Streaming edits every ~1.2 s are OK per chat; many chats → rate limits |
 | Dahl / BYOK | Provider-specific | Shared key exhausts fast; **BYOK** spreads load |
-| Manus API | **~10 `task.create`/min per user account** | Concurrent image jobs are the tightest limit |
+| Manus API | **~10 `task.create`/min per user account** + queue on bot | `MANUS_MAX_CONCURRENT` (default 2) + wait queue |
 
-**Rough concurrent users without crashing (this stack):**
+### Storage policy (DB hygiene)
+- **Only the current conversation** (last ~40 messages) stays in Supabase.
+- Starting a **new chat** deletes previous conversations/messages from the server.
+- Telegram chat history is **not** deleted — it stays in the user’s Telegram app.
+- `usage` table is **not written** by default (`SKIP_USAGE_TABLE=true`); quotas live in `user_quotas`.
+- **Lifetime token cap** per user (default **3,000,000**) + warn at **75%** (`LIFETIME_WARN_PCT`).
+- Daily shared-key quota remains (default 50k/day).
+
+Run SQL: `sql/03_phase5.sql` then `sql/04_storage_lifetime.sql`.
+
+### Rough concurrency
 - **Safe / sustained:** ~**5–10** simultaneous text chats  
 - **Occasional spikes:** ~**15–25** if mostly short messages, streaming OK, few Manus jobs  
 - **With Manus heavy use:** ~**2–5** Manus jobs at once on one key + a few text chats  
@@ -104,12 +114,14 @@ See capacity details (FA): [docs/SETUP_FA.md](docs/SETUP_FA.md)
 ### Environment
 See [`.env.example`](.env.example). Highlights:
 - `ALLOW_SHARED_KEY`, `STREAMING_ENABLED`, `DEFAULT_DAILY_TOKEN_QUOTA`
+- `DEFAULT_LIFETIME_TOKEN_QUOTA` (default 3M), `LIFETIME_WARN_PCT` (75)
+- `KEEP_MESSAGES_IN_ACTIVE_CHAT`, `SKIP_USAGE_TABLE`
 - `QUOTA_APPLIES_TO_OWN_KEYS`, `ADMIN_TELEGRAM_IDS`
-- `MANUS_API_KEY`, `MANUS_LOCALE`, `MANUS_TIMEOUT_SEC`
+- `MANUS_API_KEY`, `MANUS_MAX_CONCURRENT`, `MANUS_TIMEOUT_SEC`
 
 ### Database
-`users`, `conversations`, `messages`, `usage`, `user_api_keys`, `user_quotas`  
-SQL under [`sql/`](sql/).
+`users`, `conversations` (active only), `messages` (trimmed), `user_api_keys`, `user_quotas`  
+SQL under [`sql/`](sql/) — run `01` → `02` → `03` → `04`.
 
 ### Security
 - Never commit `.env`. Rotate leaked tokens.

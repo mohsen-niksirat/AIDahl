@@ -1,13 +1,15 @@
 import os
 import re
+import io
 import json
 import html
 import uuid
 import time
 import base64
 import logging
+import threading
 from datetime import datetime, timezone, date
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
@@ -36,9 +38,21 @@ MANUS_LOCALE = os.getenv("MANUS_LOCALE", "").strip()  # empty = send no locale
 # Optional shared Manus key if a user has no personal key
 MANUS_SHARED_API_KEY = os.getenv("MANUS_API_KEY") or os.getenv("MANUS_SHARED_API_KEY")
 
+# Concurrency queue — free-tier Nano (128MB) cannot handle many simultaneous agent jobs
+MANUS_MAX_CONCURRENT = max(1, int(os.getenv("MANUS_MAX_CONCURRENT", "2")))
+MANUS_QUEUE_MAX = max(1, int(os.getenv("MANUS_QUEUE_MAX", "15")))
+MANUS_MAX_PER_USER = max(1, int(os.getenv("MANUS_MAX_PER_USER", "1")))
+
 STREAMING_ENABLED = os.getenv("STREAMING_ENABLED", "true").lower() in ("1", "true", "yes")
 STREAM_EDIT_INTERVAL = float(os.getenv("STREAM_EDIT_INTERVAL", "1.2"))
 DEFAULT_DAILY_TOKEN_QUOTA = int(os.getenv("DEFAULT_DAILY_TOKEN_QUOTA", "50000"))
+# Lifetime (overall) token budget per user — generous but bounded
+DEFAULT_LIFETIME_TOKEN_QUOTA = int(os.getenv("DEFAULT_LIFETIME_TOKEN_QUOTA", "3000000"))
+LIFETIME_WARN_PCT = float(os.getenv("LIFETIME_WARN_PCT", "75"))
+# Keep only the active conversation in DB; purge others on new chat
+KEEP_MESSAGES_IN_ACTIVE_CHAT = int(os.getenv("KEEP_MESSAGES_IN_ACTIVE_CHAT", "40"))
+# Do not grow the usage table — counters live in user_quotas
+SKIP_USAGE_TABLE = os.getenv("SKIP_USAGE_TABLE", "true").lower() in ("1", "true", "yes")
 QUOTA_APPLIES_TO_OWN_KEYS = os.getenv("QUOTA_APPLIES_TO_OWN_KEYS", "false").lower() in (
     "1",
     "true",
@@ -62,6 +76,16 @@ logging.basicConfig(level=logging.INFO)
 bot = telebot.TeleBot(BOT_TOKEN)
 
 PENDING: Dict[int, Dict[str, str]] = {}
+
+# Manus job queue (in-memory; single Deployka container)
+_MANUS_LOCK = threading.Lock()
+_MANUS_ACTIVE = 0
+_MANUS_QUEUE: deque = deque()  # jobs waiting
+_MANUS_RUNNING_USERS: set = set()  # user_ids currently executing
+_MANUS_QUEUED_USERS: set = set()  # user_ids waiting in queue
+# Multi-turn Manus: user_id -> {task_id, task_url, updated_at, title}
+_MANUS_SESSIONS: Dict[int, dict] = {}
+MANUS_FOLLOWUP_TTL_SEC = int(os.getenv("MANUS_FOLLOWUP_TTL_SEC", "7200"))
 
 MODEL_SEP = "|"
 LEGACY_PROVIDER = "dahl"
@@ -508,7 +532,7 @@ def delete_user_key(user_id: int, provider: str) -> bool:
         return False
 
 
-# --- Quota ---
+# --- Quota (daily + lifetime) ---
 
 def ensure_quota_row(user_id: int) -> dict:
     row = {
@@ -516,28 +540,47 @@ def ensure_quota_row(user_id: int) -> dict:
         "daily_limit": DEFAULT_DAILY_TOKEN_QUOTA,
         "used_today": 0,
         "reset_at": today_date_str(),
+        "lifetime_limit": DEFAULT_LIFETIME_TOKEN_QUOTA,
+        "lifetime_used": 0,
     }
     try:
         res = sb_get(
             f"user_quotas?user_id=eq.{user_id}"
-            f"&select=user_id,daily_limit,used_today,reset_at"
+            f"&select=user_id,daily_limit,used_today,reset_at,lifetime_limit,lifetime_used"
         )
         if res.status_code >= 400:
-            # table missing — unlimited until SQL 03 runs
-            return {"ok": False, **row, "table_missing": True}
+            # columns missing (SQL 03/04 not run) — try legacy select
+            res = sb_get(
+                f"user_quotas?user_id=eq.{user_id}"
+                f"&select=user_id,daily_limit,used_today,reset_at"
+            )
+            if res.status_code >= 400:
+                return {"ok": False, **row, "table_missing": True}
         data = res.json() or []
         if data:
-            row = data[0]
+            row.update({k: v for k, v in data[0].items() if v is not None})
             row["table_missing"] = False
             row["ok"] = True
+            if row.get("lifetime_limit") is None:
+                row["lifetime_limit"] = DEFAULT_LIFETIME_TOKEN_QUOTA
+            if row.get("lifetime_used") is None:
+                row["lifetime_used"] = 0
         else:
-            sb_post("user_quotas", {
+            payload = {
                 "user_id": user_id,
                 "daily_limit": DEFAULT_DAILY_TOKEN_QUOTA,
                 "used_today": 0,
                 "reset_at": today_date_str(),
+                "lifetime_limit": DEFAULT_LIFETIME_TOKEN_QUOTA,
+                "lifetime_used": 0,
                 "updated_at": utcnow_iso(),
-            })
+            }
+            r = sb_post("user_quotas", payload)
+            if r.status_code >= 400:
+                # retry without lifetime columns
+                payload.pop("lifetime_limit", None)
+                payload.pop("lifetime_used", None)
+                sb_post("user_quotas", payload)
             row["table_missing"] = False
             row["ok"] = True
     except Exception as e:
@@ -549,7 +592,7 @@ def ensure_quota_row(user_id: int) -> dict:
 
 def quota_status(user_id: int) -> dict:
     row = ensure_quota_row(user_id)
-    limit = int(row.get("daily_limit") or DEFAULT_DAILY_TOKEN_QUOTA)
+    daily_limit = int(row.get("daily_limit") or DEFAULT_DAILY_TOKEN_QUOTA)
     used = int(row.get("used_today") or 0)
     reset_at = str(row.get("reset_at") or today_date_str())
     today = today_date_str()
@@ -562,56 +605,196 @@ def quota_status(user_id: int) -> dict:
             )
         except Exception:
             pass
-    remaining = max(limit - used, 0)
+
+    lifetime_limit = int(row.get("lifetime_limit") or DEFAULT_LIFETIME_TOKEN_QUOTA)
+    lifetime_used = int(row.get("lifetime_used") or 0)
+    lifetime_remaining = max(lifetime_limit - lifetime_used, 0) if lifetime_limit > 0 else None
+    lifetime_pct = (
+        (lifetime_used / lifetime_limit * 100.0) if lifetime_limit > 0 else 0.0
+    )
+    lifetime_exceeded = lifetime_limit > 0 and lifetime_used >= lifetime_limit
+    lifetime_warn = (
+        lifetime_limit > 0
+        and not lifetime_exceeded
+        and lifetime_pct >= LIFETIME_WARN_PCT
+    )
+
     return {
         "ok": bool(row.get("ok")),
         "table_missing": bool(row.get("table_missing")),
-        "limit": limit,
+        "limit": daily_limit,
         "used": used,
-        "remaining": remaining,
+        "remaining": max(daily_limit - used, 0),
         "reset_at": today if reset_at < today else reset_at,
-        "exceeded": used >= limit and limit > 0,
+        "exceeded": used >= daily_limit and daily_limit > 0,
+        "lifetime_limit": lifetime_limit,
+        "lifetime_used": lifetime_used,
+        "lifetime_remaining": lifetime_remaining,
+        "lifetime_pct": lifetime_pct,
+        "lifetime_exceeded": lifetime_exceeded,
+        "lifetime_warn": lifetime_warn,
     }
 
 
-def quota_add_usage(user_id: int, tokens: int) -> None:
+def quota_add_usage(user_id: int, tokens: int) -> dict:
+    """Increment daily + lifetime counters. Returns updated status."""
     if tokens <= 0:
-        return
+        return quota_status(user_id)
     status = quota_status(user_id)
     if not status.get("ok"):
-        return
+        return status
+    new_daily = status["used"] + tokens
+    new_life = status["lifetime_used"] + tokens
     try:
         sb_patch(
             f"user_quotas?user_id=eq.{user_id}",
             {
-                "used_today": status["used"] + tokens,
+                "used_today": new_daily,
                 "reset_at": today_date_str(),
+                "lifetime_used": new_life,
                 "updated_at": utcnow_iso(),
             },
         )
     except Exception as e:
         logging.error(f"quota_add_usage error: {e}")
+        try:
+            sb_patch(
+                f"user_quotas?user_id=eq.{user_id}",
+                {
+                    "used_today": new_daily,
+                    "reset_at": today_date_str(),
+                    "updated_at": utcnow_iso(),
+                },
+            )
+        except Exception as e2:
+            logging.error(f"quota_add_usage daily-only: {e2}")
+    return quota_status(user_id)
 
 
 def quota_allowed(user_id: int, source: str) -> Tuple[bool, dict]:
-    """source: 'user' | 'shared'"""
-    if source == "user" and not QUOTA_APPLIES_TO_OWN_KEYS:
-        return True, quota_status(user_id)
+    """
+    source: 'user' | 'shared'
+    Lifetime limit always applies (overall per-user cap).
+    Daily limit applies to shared key; optional for personal keys.
+    """
     status = quota_status(user_id)
     if status.get("table_missing"):
+        return True, status
+    if status.get("lifetime_exceeded"):
+        return False, status
+    if source == "user" and not QUOTA_APPLIES_TO_OWN_KEYS:
         return True, status
     return (not status["exceeded"]), status
 
 
 def format_quota_block(status: dict, applies_note: str = "") -> str:
     if status.get("table_missing"):
-        return "سهمیه روزانه: (جدول `user_quotas` هنوز ساخته نشده — sql/03)\n"
-    return (
-        f"سهمیه روزانه: `{status['used']:,}` / `{status['limit']:,}`\n"
-        f"باقیمانده امروز: `{status['remaining']:,}`\n"
-        f"ریست: `{status['reset_at']}`\n"
-        f"{applies_note}"
-    )
+        return (
+            "سهمیه: جدول `user_quotas` ساخته نشده — sql/03 و sql/04 را اجرا کنید.\n"
+        )
+    life = status.get("lifetime_limit") or 0
+    life_used = status.get("lifetime_used") or 0
+    life_rem = status.get("lifetime_remaining")
+    life_pct = status.get("lifetime_pct") or 0
+    lines = [
+        f"**سهمیه کلی (مادام‌العمر)**",
+        f"مصرف: `{life_used:,}` / `{life:,}` (`{life_pct:.0f}%`)",
+    ]
+    if life_rem is not None:
+        lines.append(f"باقیمانده کل: `{life_rem:,}`")
+    if status.get("lifetime_exceeded"):
+        lines.append("⛔️ **سهمیه کلی تمام شده است**")
+    elif status.get("lifetime_warn"):
+        lines.append("⚠️ **دارید به سقف کلی نزدیک می‌شوید**")
+    lines.append("")
+    lines.append("**سهمیه روزانه (کلید مشترک ربات)**")
+    lines.append(f"امروز: `{status['used']:,}` / `{status['limit']:,}`")
+    lines.append(f"باقیمانده امروز: `{status['remaining']:,}`")
+    lines.append(f"ریست روزانه: `{status['reset_at']}`")
+    if applies_note:
+        lines.append(applies_note.strip())
+    return "\n".join(lines) + "\n"
+
+
+def quota_warning_text(status: dict) -> Optional[str]:
+    if status.get("lifetime_exceeded"):
+        return (
+            "⛔️ **سهمیه کلی شما تمام شد.**\n"
+            f"مصرف: `{status.get('lifetime_used', 0):,}` / "
+            f"`{status.get('lifetime_limit', 0):,}`\n"
+            "چت جدید تا افزایش سهمیه یا تمدید امکان‌پذیر نیست."
+        )
+    if status.get("lifetime_warn"):
+        rem = status.get("lifetime_remaining")
+        rem_s = f"`{rem:,}`" if rem is not None else "—"
+        return (
+            "⚠️ **هشدار سهمیه**\n"
+            f"به **{status.get('lifetime_pct', 0):.0f}%** سقف کلی رسیده‌اید.\n"
+            f"باقیمانده: {rem_s} توکن\n"
+            "لطفاً مصرف را مدیریت کنید."
+        )
+    return None
+
+
+# --- Storage hygiene: keep only active conversation ---
+
+def purge_user_old_conversations(user_id: int, keep_conversation_id: Optional[str]) -> int:
+    """
+    Delete all conversations + messages for user except keep_conversation_id.
+    Telegram chat history stays in Telegram; server keeps only current session.
+    """
+    deleted = 0
+    try:
+        res = sb_get(
+            f"conversations?user_id=eq.{user_id}&select=id"
+        )
+        rows = res.json() or []
+        if not isinstance(rows, list):
+            return 0
+        for row in rows:
+            cid = str(row.get("id") or "")
+            if not cid or (keep_conversation_id and cid == str(keep_conversation_id)):
+                continue
+            try:
+                sb_delete(f"messages?conversation_id=eq.{cid}")
+                sb_delete(f"conversations?id=eq.{cid}")
+                deleted += 1
+            except Exception as e:
+                logging.warning(f"purge conv {cid}: {e}")
+    except Exception as e:
+        logging.error(f"purge_user_old_conversations: {e}")
+    logging.info(f"purge conversations user={user_id} keep={keep_conversation_id} deleted={deleted}")
+    return deleted
+
+
+def trim_conversation_messages(conversation_id: str, keep_last: Optional[int] = None) -> int:
+    """Keep only the last N messages of the active conversation in DB."""
+    if not conversation_id:
+        return 0
+    keep = keep_last if keep_last is not None else KEEP_MESSAGES_IN_ACTIVE_CHAT
+    if keep <= 0:
+        return 0
+    try:
+        res = sb_get(
+            f"messages?conversation_id=eq.{conversation_id}&order=id.desc&select=id"
+        )
+        rows = res.json() or []
+        if not isinstance(rows, list) or len(rows) <= keep:
+            return 0
+        drop_ids = [r["id"] for r in rows[keep:] if r.get("id") is not None]
+        if not drop_ids:
+            return 0
+        # PostgREST: delete by id in (...) — batch in chunks
+        removed = 0
+        for i in range(0, len(drop_ids), 20):
+            chunk = drop_ids[i : i + 20]
+            id_list = ",".join(str(x) for x in chunk)
+            sb_delete(f"messages?id=in.({id_list})")
+            removed += len(chunk)
+        return removed
+    except Exception as e:
+        logging.error(f"trim_conversation_messages: {e}")
+        return 0
 
 
 # --- Conversations ---
@@ -633,6 +816,8 @@ def create_conversation(user_id: int, model: str, title: str = "گفتگوی ج�
         logging.error(f"create_conversation error: {e}")
         raise
     set_user_settings(user_id, active_conversation_id=conversation_id)
+    # Storage policy: only the current conversation remains on our server
+    purge_user_old_conversations(user_id, keep_conversation_id=conversation_id)
     return {"id": conversation_id, "title": title[:80], "model": model}
 
 
@@ -761,6 +946,9 @@ def log_usage(
     total_tok: int,
     provider: str = LEGACY_PROVIDER,
 ) -> None:
+    """Optional usage log. Disabled by default so the DB does not fill up."""
+    if SKIP_USAGE_TABLE:
+        return
     payload = {
         "user_id": user_id,
         "model": format_model_ref(provider, model) if provider else model,
@@ -1081,53 +1269,182 @@ def extract_media_from_message(message) -> Optional[dict]:
         return None
 
 
-def manus_list_messages(api_key: str, task_id: str, limit: int = 30) -> list:
+def manus_list_messages(api_key: str, task_id: str, limit: int = 50) -> list:
     url = (
         f"{MANUS_BASE_URL}/v2/task.listMessages"
         f"?task_id={task_id}&order=desc&limit={limit}"
     )
-    with httpx.Client(timeout=20.0) as client:
-        res = client.get(url, headers=manus_headers(api_key))
     try:
+        with httpx.Client(timeout=20.0) as client:
+            res = client.get(url, headers=manus_headers(api_key))
         data = res.json()
-    except Exception:
+    except Exception as e:
+        logging.error(f"manus_list_messages: {e}")
         return []
+    if isinstance(data, list):
+        return data
     if not isinstance(data, dict):
         return []
-    # v2 wrap: {ok, messages/data/events}
-    for key in ("messages", "data", "events", "items"):
+    for key in ("messages", "data", "events", "items", "result"):
         val = data.get(key)
         if isinstance(val, list):
             return val
-        if isinstance(val, dict) and isinstance(val.get("messages"), list):
-            return val["messages"]
-        if isinstance(val, dict) and isinstance(val.get("data"), list):
-            return val["data"]
-    # maybe unwrapped list already handled; try nested under result
-    result = data.get("result")
-    if isinstance(result, list):
-        return result
+        if isinstance(val, dict):
+            for sub in ("messages", "data", "events", "items"):
+                if isinstance(val.get(sub), list):
+                    return val[sub]
     return []
 
 
+def manus_task_detail(api_key: str, task_id: str) -> dict:
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            res = client.get(
+                f"{MANUS_BASE_URL}/v2/task.detail?task_id={task_id}",
+                headers=manus_headers(api_key),
+            )
+        data = res.json()
+    except Exception as e:
+        logging.error(f"manus_task_detail: {e}")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data.get("data") or data.get("task") or data
+
+
+_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
+_FILE_HOST_HINTS = (
+    "manuscdn.com",
+    "files.manus",
+    "manus.im",
+    "amazonaws.com",
+    "s3.",
+    "blob.core.windows.net",
+    "googleusercontent.com",
+)
+
+
+def _looks_like_media_url(url: str) -> bool:
+    u = (url or "").lower()
+    if not u.startswith("http"):
+        return False
+    if any(ext in u for ext in _IMAGE_EXT + (".pdf", ".md", ".zip", ".docx", ".mp4", ".webm")):
+        return True
+    if any(h in u for h in _FILE_HOST_HINTS) and any(
+        k in u for k in ("/file", "/files", "/asset", "/media", "/upload", "/download", "/cdn")
+    ):
+        return True
+    # signed / static image paths without extension
+    if any(h in u for h in _FILE_HOST_HINTS) and any(k in u for k in ("image", "png", "jpg", "webp")):
+        return True
+    return False
+
+
+def _filename_from_url(url: str, fallback: str = "manus-output") -> str:
+    try:
+        path = url.split("?")[0].rstrip("/")
+        name = path.split("/")[-1] or fallback
+        name = re.sub(r"[^\w.\-]+", "_", name)[:80]
+        return name or fallback
+    except Exception:
+        return fallback
+
+
+def _mime_from_name(name: str, url: str = "") -> str:
+    blob = (name + " " + url).lower()
+    if any(x in blob for x in (".png", "image/png")):
+        return "image/png"
+    if any(x in blob for x in (".jpg", ".jpeg", "image/jpeg")):
+        return "image/jpeg"
+    if any(x in blob for x in (".webp", "image/webp")):
+        return "image/webp"
+    if any(x in blob for x in (".gif", "image/gif")):
+        return "image/gif"
+    if ".pdf" in blob:
+        return "application/pdf"
+    if any(x in blob for x in (".md", "text/markdown")):
+        return "text/markdown"
+    if ".zip" in blob:
+        return "application/zip"
+    return ""
+
+
+def _walk_manus_files(obj, files: List[dict], assistant_texts: List[str], depth: int = 0):
+    """Deep-scan Manus JSON for any downloadable media/file URLs."""
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        # collect text
+        if obj.get("text") and isinstance(obj["text"], str):
+            t = obj["text"].strip()
+            if len(t) > 40 and not t.startswith("http"):
+                assistant_texts.append(t)
+        for key in (
+            "fileUrl",
+            "file_url",
+            "url",
+            "download_url",
+            "downloadUrl",
+            "src",
+            "href",
+            "image_url",
+            "imageUrl",
+            "file_url_signed",
+            "public_url",
+        ):
+            val = obj.get(key)
+            if isinstance(val, str) and val.startswith("http") and _looks_like_media_url(val):
+                name = (
+                    obj.get("fileName")
+                    or obj.get("filename")
+                    or obj.get("name")
+                    or _filename_from_url(val)
+                )
+                mime = obj.get("mimeType") or obj.get("mime_type") or obj.get("type")
+                if mime == "file" or mime == "output_file" or mime == "image":
+                    mime = obj.get("mimeType") or obj.get("mime_type") or _mime_from_name(name, val)
+                if not mime or mime in ("file", "output_file", "image"):
+                    mime = _mime_from_name(name, val)
+                # skip tiny avatars / icons
+                if any(x in val.lower() for x in ("avatar", "favicon", "icon-32", "logo-light")):
+                    continue
+                files.append({"url": val, "name": str(name)[:80], "mime": mime or ""})
+        for v in obj.values():
+            _walk_manus_files(v, files, assistant_texts, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            _walk_manus_files(item, files, assistant_texts, depth + 1)
+    elif isinstance(obj, str):
+        # markdown image links
+        for m in re.findall(r"https?://[^\s\)\"']+", obj):
+            if _looks_like_media_url(m):
+                files.append({
+                    "url": m,
+                    "name": _filename_from_url(m),
+                    "mime": _mime_from_name("", m),
+                })
+
+
 def manus_extract_from_messages(messages: List[dict]) -> dict:
-    """Parse Manus task events for final assistant text + file URLs."""
+    """Parse Manus task events — deep scan for assistant text + media URLs."""
     agent_status = None
     status_detail = {}
     assistant_texts: List[str] = []
     files: List[dict] = []
     error_text = None
 
-    for item in messages:
+    items = messages if isinstance(messages, list) else []
+    for item in items:
         if not isinstance(item, dict):
             continue
         etype = item.get("type") or item.get("event_type")
 
         if etype == "status_update" or "status_update" in item:
             su = item.get("status_update") or item
-            agent_status = su.get("agent_status") or agent_status
-            if su.get("status_detail"):
-                status_detail = su["status_detail"]
+            if isinstance(su, dict):
+                agent_status = su.get("agent_status") or agent_status
+                if su.get("status_detail"):
+                    status_detail = su["status_detail"]
 
         if etype == "error_message" or item.get("error_message"):
             err = item.get("error_message")
@@ -1138,51 +1455,102 @@ def manus_extract_from_messages(messages: List[dict]) -> dict:
 
         if etype == "assistant_message" or item.get("assistant_message"):
             am = item.get("assistant_message") or item
-            content = am.get("content")
-            if isinstance(content, str) and content.strip():
-                assistant_texts.append(content.strip())
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    if part.get("type") in (None, "text", "output_text") and part.get("text"):
-                        assistant_texts.append(str(part["text"]).strip())
-                    furl = part.get("fileUrl") or part.get("file_url") or part.get("url")
-                    if furl:
-                        files.append({
-                            "url": furl,
-                            "name": part.get("fileName") or part.get("filename") or "manus-file",
-                            "mime": part.get("mimeType") or part.get("mime_type") or "",
-                        })
+            if isinstance(am, dict):
+                content = am.get("content")
+                if isinstance(content, str) and content.strip() and not content.startswith("http"):
+                    assistant_texts.append(content.strip())
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("text"):
+                            t = str(part["text"]).strip()
+                            if t and not t.startswith("http"):
+                                assistant_texts.append(t)
 
-        # Generic file parts at event level
-        furl = item.get("fileUrl") or item.get("file_url") or item.get("url")
-        if furl and any(ext in str(furl).lower() for ext in (
-            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".pdf", ".md", ".zip"
-        )):
-            files.append({
-                "url": furl,
-                "name": item.get("fileName") or item.get("filename") or str(furl).split("/")[-1][:40],
-                "mime": item.get("mimeType") or item.get("mime_type") or "",
-            })
+        _walk_manus_files(item, files, assistant_texts)
 
-    # de-dupe files by url
+    # unique by url
     seen = set()
     uniq_files = []
     for f in files:
-        if f["url"] in seen:
+        u = f.get("url")
+        if not u or u in seen:
             continue
-        seen.add(f["url"])
+        seen.add(u)
         uniq_files.append(f)
 
-    text = "\n\n".join(assistant_texts[-3:]) if assistant_texts else ""
+    # Prefer images first for delivery
+    uniq_files.sort(key=lambda f: (0 if str(f.get("mime", "")).startswith("image") or any(
+        x in str(f.get("url", "")).lower() for x in _IMAGE_EXT
+    ) else 1))
+
+    # unique texts, keep last meaningful
+    uniq_texts = []
+    for t in assistant_texts:
+        t = t.strip()
+        if t and t not in uniq_texts:
+            uniq_texts.append(t)
+    text = "\n\n".join(uniq_texts[-3:]) if uniq_texts else ""
+
     return {
         "agent_status": agent_status,
         "status_detail": status_detail,
         "text": text,
-        "files": uniq_files[:6],
+        "files": uniq_files[:8],
         "error": error_text,
     }
+
+
+def manus_collect_files(api_key: str, task_id: str, extra_limit: int = 50) -> List[dict]:
+    """Harvest file URLs from listMessages + task.detail."""
+    files: List[dict] = []
+    texts: List[str] = []
+    try:
+        msgs = manus_list_messages(api_key, task_id, limit=extra_limit)
+        ex = manus_extract_from_messages(msgs)
+        files.extend(ex.get("files") or [])
+        texts.extend([ex.get("text") or ""])
+    except Exception as e:
+        logging.error(f"collect from messages: {e}")
+    try:
+        detail = manus_task_detail(api_key, task_id)
+        if detail:
+            _walk_manus_files(detail, files, texts)
+    except Exception as e:
+        logging.error(f"collect from detail: {e}")
+    seen = set()
+    out = []
+    for f in files:
+        u = f.get("url")
+        if u and u not in seen:
+            seen.add(u)
+            out.append(f)
+    out.sort(key=lambda f: (
+        0 if str(f.get("mime", "")).startswith("image") or any(
+            x in str(f.get("url", "")).lower() for x in _IMAGE_EXT
+        ) else 1
+    ))
+    return out
+
+
+def manus_download_file(url: str, api_key: str) -> Optional[bytes]:
+    """Download a Manus (or CDN) file; try with API key, then public."""
+    headers_auth = {
+        "x-manus-api-key": api_key,
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "AIDahlBot/1.0",
+    }
+    for headers in (headers_auth, {"User-Agent": "AIDahlBot/1.0"}):
+        try:
+            with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+                res = client.get(url, headers=headers)
+            if res.status_code == 200 and res.content and len(res.content) > 100:
+                ctype = res.headers.get("content-type", "")
+                if "text/html" in ctype and len(res.content) < 5000:
+                    continue
+                return res.content
+        except Exception as e:
+            logging.warning(f"manus_download_file try failed: {e}")
+    return None
 
 
 def manus_wait_for_task(
@@ -1191,7 +1559,7 @@ def manus_wait_for_task(
     timeout_sec: Optional[int] = None,
     on_progress=None,
 ) -> dict:
-    """Poll Manus until stopped / waiting / error / timeout."""
+    """Poll Manus until terminal status; keep hunting files after stop."""
     deadline = time.time() + (timeout_sec or MANUS_TIMEOUT_SEC)
     last = {
         "agent_status": "running",
@@ -1202,26 +1570,56 @@ def manus_wait_for_task(
         "timed_out": False,
         "task_id": task_id,
     }
-    while time.time() < deadline:
-        messages = manus_list_messages(api_key, task_id)
-        extracted = manus_extract_from_messages(messages)
+    extra_file_wait = 45  # seconds after stop to catch late-exported images
+    extra_deadline = None
+
+    while time.time() < deadline or (extra_deadline and time.time() < extra_deadline):
+        try:
+            messages = manus_list_messages(api_key, task_id)
+            extracted = manus_extract_from_messages(messages)
+        except Exception as e:
+            logging.error(f"manus poll error: {e}")
+            extracted = {}
+
+        harvested = manus_collect_files(api_key, task_id)
+        merged_files = harvested or (extracted.get("files") or [])
+        # merge with existing
+        have = {f.get("url") for f in last.get("files") or []}
+        for f in merged_files:
+            if f.get("url") not in have:
+                last.setdefault("files", []).append(f)
+                have.add(f.get("url"))
+
         last.update({
             "agent_status": extracted.get("agent_status") or last["agent_status"],
             "status_detail": extracted.get("status_detail") or last.get("status_detail") or {},
             "text": extracted.get("text") or last.get("text") or "",
-            "files": extracted.get("files") or last.get("files") or [],
-            "error": extracted.get("error"),
+            "error": extracted.get("error") or last.get("error"),
+            "files": last.get("files") or merged_files,
         })
+
         status = last.get("agent_status")
         if on_progress:
             try:
                 on_progress(last)
             except Exception as e:
-                logging.warning(f"manus on_progress: {e}")
+                logging.warning(f"on_progress error: {e}")
+
         if status in ("stopped", "error", "waiting", "completed"):
-            return last
+            # images sometimes appear slightly after agent stops
+            if last.get("files") or status in ("error", "waiting"):
+                return last
+            if extra_deadline is None:
+                extra_deadline = time.time() + extra_file_wait
+            time.sleep(MANUS_POLL_INTERVAL)
+            continue
+
         time.sleep(MANUS_POLL_INTERVAL)
-    last["timed_out"] = True
+
+    if not last.get("timed_out"):
+        # reached end without terminal clear
+        if last.get("agent_status") not in ("stopped", "error", "waiting", "completed"):
+            last["timed_out"] = True
     return last
 
 
@@ -1253,25 +1651,127 @@ def manus_credits_text(api_key: str) -> str:
         return f"خطا در دریافت credits: {e}"
 
 
-def manus_deliver_result(chat_id: int, status_msg, result: dict, task_url: Optional[str]):
-    """Send final Manus output to Telegram (text + up to a few files)."""
+def _is_image_file(f: dict) -> bool:
+    mime = str(f.get("mime") or "").lower()
+    url = str(f.get("url") or "").lower()
+    name = str(f.get("name") or "").lower()
+    if mime.startswith("image/"):
+        return True
+    return any(x in url or x in name for x in _IMAGE_EXT)
+
+
+def manus_send_file_pair(chat_id: int, content: bytes, name: str, f: dict):
+    """Send image as chat photo + as original document (high quality)."""
+    safe_name = (name or "manus-output").strip() or "manus-output"
+    if _is_image_file(f):
+        # ensure a proper extension for Telegram
+        if not any(safe_name.lower().endswith(ext) for ext in _IMAGE_EXT):
+            mime = str(f.get("mime") or "").lower()
+            ext = ".png"
+            if "jpeg" in mime or "jpg" in mime:
+                ext = ".jpg"
+            elif "webp" in mime:
+                ext = ".webp"
+            elif "gif" in mime:
+                ext = ".gif"
+            elif ".jpg" in safe_name.lower() or ".jpeg" in safe_name.lower():
+                ext = ".jpg"
+            safe_name = safe_name + ext
+
+        bio_photo = io.BytesIO(content)
+        bio_photo.name = safe_name
+        try:
+            bot.send_photo(
+                chat_id,
+                bio_photo,
+                caption=f"🖼 نمایش در چت — {safe_name}",
+            )
+        except Exception as e:
+            logging.warning(f"send_photo failed: {e}")
+            try:
+                bot.send_message(chat_id, f"⚠️ ارسال عکس preview ناموفق: {e}")
+            except Exception:
+                pass
+
+        bio_doc = io.BytesIO(content)
+        bio_doc.name = safe_name
+        try:
+            bot.send_document(
+                chat_id,
+                bio_doc,
+                caption=f"📎 فایل باکیفیت (اصلی) — {safe_name}",
+                visible_file_name=safe_name,
+            )
+        except Exception as e:
+            logging.warning(f"send_document image failed: {e}")
+            try:
+                bot.send_document(
+                    chat_id,
+                    io.BytesIO(content),
+                    caption=f"📎 فایل — {safe_name}",
+                )
+            except Exception as e2:
+                logging.error(f"send_document retry failed: {e2}")
+                bot.send_message(chat_id, f"⚠️ ارسال فایل ناموفق: {safe_name}\n{e2}")
+    else:
+        bio_doc = io.BytesIO(content)
+        bio_doc.name = safe_name
+        try:
+            bot.send_document(
+                chat_id,
+                bio_doc,
+                caption=f"📎 فایل Manus — {safe_name}",
+                visible_file_name=safe_name,
+            )
+        except Exception as e:
+            logging.error(f"send_document failed: {e}")
+            bot.send_message(chat_id, f"📎 {safe_name}\n{f.get('url')}")
+
+
+def manus_deliver_result(
+    chat_id: int,
+    status_msg,
+    result: dict,
+    task_url: Optional[str],
+    api_key: Optional[str] = None,
+    task_id: Optional[str] = None,
+):
+    """Send final Manus output to Telegram — text + photo + original file."""
     status = result.get("agent_status") or "?"
     text = (result.get("text") or "").strip()
-    files = result.get("files") or []
+    files = list(result.get("files") or [])
     error = result.get("error")
     timed_out = result.get("timed_out")
 
+    # last-chance harvest if we have credentials
+    if api_key and task_id:
+        try:
+            more = manus_collect_files(api_key, task_id)
+            have = {f.get("url") for f in files}
+            for f in more:
+                if f.get("url") not in have:
+                    files.append(f)
+                    have.add(f.get("url"))
+        except Exception as e:
+            logging.warning(f"deliver harvest: {e}")
+
     if status == "error" or error:
         msg = f"❌ Manus agent خطا داد.\n`{error or status}`"
+        if files:
+            msg += f"\nفایل‌های موجود: {len(files)}"
         if task_url:
             msg += f"\n{task_url}"
         try:
-            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+            bot.edit_message_text(
+                msg,
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
         except Exception:
             bot.send_message(chat_id, msg)
-        return
-
-    if status == "waiting":
+        # still try to deliver any files found
+    elif status == "waiting":
         detail = result.get("status_detail") or {}
         waiting_desc = detail.get("waiting_description") or detail.get("waiting_for_event_type") or ""
         msg = (
@@ -1282,59 +1782,354 @@ def manus_deliver_result(chat_id: int, status_msg, result: dict, task_url: Optio
         if task_url:
             msg += f"\n{task_url}"
         try:
-            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+            bot.edit_message_text(
+                msg,
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
         except Exception:
             bot.send_message(chat_id, msg)
         return
-
-    if timed_out and not text and not files:
-        msg = (
-            "⌛️ Manus هنوز کار می‌کند یا پاسخ نداد (timeout).\n"
-            "بعداً task را در پنل Manus چک کنید."
-        )
+    else:
+        final = text or "✅ Manus task تمام شد."
+        if files:
+            final += f"\n\n📦 فایل‌ها: {len(files)} — عکس preview + فایل اصلی در پیام‌های بعدی"
         if task_url:
-            msg += f"\n{task_url}"
+            final += f"\n\n🔗 {task_url}"
         try:
-            bot.edit_message_text(msg, chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode="Markdown")
+            send_bot_reply(
+                status_msg.chat.id, status_msg.message_id, final, style="html"
+            )
         except Exception:
-            bot.send_message(chat_id, msg)
+            try:
+                bot.edit_message_text(
+                    truncate_message(final),
+                    chat_id=status_msg.chat.id,
+                    message_id=status_msg.message_id,
+                    parse_mode=None,
+                )
+            except Exception:
+                bot.send_message(chat_id, truncate_message(final))
+
+    if not files:
+        bot.send_message(
+            chat_id,
+            "⚠️ هیچ URL فایل/عکسی در payload پیدا نشد.\n"
+            "اگر عکس در manus.im هست، API هنوز لینک قابل دانلود برنگردانده "
+            "یا ساختار پیام تغییر کرده است.\n"
+            f"{task_url or ''}",
+        )
+        logging.warning(f"manus deliver: no files. status={status} task={task_id}")
         return
 
-    final = text or "✅ Manus task تمام شد."
-    if task_url:
-        final += f"\n\n🔗 {task_url}"
-    try:
-        send_bot_reply(status_msg.chat.id, status_msg.message_id, final, style="html")
-    except Exception:
-        try:
-            bot.edit_message_text(truncate_message(final), chat_id=status_msg.chat.id, message_id=status_msg.message_id, parse_mode=None)
-        except Exception:
-            bot.send_message(chat_id, truncate_message(final))
-
-    # Send files (images / docs) — Telegram fetches URL server-side when possible
-    sent = 0
-    for f in files[:4]:
+    delivered = 0
+    for f in files[:6]:
         url = f.get("url")
         if not url:
             continue
-        name = (f.get("name") or "file")[:60]
-        mime = (f.get("mime") or "").lower()
-        lower = (url + name + mime).lower()
-        try:
-            if any(x in lower for x in (".png", ".jpg", ".jpeg", ".webp", ".gif", "image/")):
-                bot.send_photo(chat_id, url, caption=f"🖼 {name}")
-            else:
-                bot.send_document(chat_id, url, caption=f"📎 {name}")
-            sent += 1
-        except Exception as e:
-            logging.warning(f"manus send file failed: {e}")
+        name = f.get("name") or _filename_from_url(url)
+        content = None
+        if api_key:
+            content = manus_download_file(url, api_key)
+        if not content:
+            content = manus_download_file(url, "")
+        if not content:
+            logging.warning(f"download failed for {url}")
             try:
-                bot.send_message(chat_id, f"📎 فایل: {name}\n{url}")
+                bot.send_message(chat_id, f"❌ دانلود فایل ناموفق:\n`{name}`\n{url}")
             except Exception:
                 pass
-    if files and sent == 0:
+            continue
+        try:
+            manus_send_file_pair(chat_id, content, name, f)
+            delivered += 1
+        except Exception as e:
+            logging.error(f"deliver file pair failed: {e}")
+            try:
+                bot.send_message(chat_id, f"❌ خطا در ارسال `{name}`: {e}")
+            except Exception:
+                pass
+
+    if delivered == 0:
         links = "\n".join(f"• {f.get('name')}: {f.get('url')}" for f in files[:4])
-        bot.send_message(chat_id, f"فایل‌های Manus:\n{links}")
+        bot.send_message(chat_id, f"فایل دانلود نشد. لینک‌ها:\n{links}")
+
+
+def manus_queue_stats() -> dict:
+    with _MANUS_LOCK:
+        return {
+            "active": _MANUS_ACTIVE,
+            "queued": len(_MANUS_QUEUE),
+            "max_concurrent": MANUS_MAX_CONCURRENT,
+            "queue_max": MANUS_QUEUE_MAX,
+        }
+
+
+def manus_queue_status_text() -> dict:
+    s = manus_queue_stats()
+    return {
+        "active": s["active"],
+        "queued": s["queued"],
+        "max_concurrent": s["max_concurrent"],
+        "text": (
+            f"📊 وضعیت صف Manus\n"
+            f"در حال اجرا: `{s['active']}/{s['max_concurrent']}`\n"
+            f"در صف: `{s['queued']}`\n"
+            f"سقف صف: `{s['queue_max']}`"
+        ),
+    }
+
+
+def manus_save_session(user_id: int, task_id: str, task_url: Optional[str] = None, title: str = ""):
+    _MANUS_SESSIONS[user_id] = {
+        "task_id": task_id,
+        "task_url": task_url or (f"https://manus.im/app/{task_id}" if task_id else None),
+        "updated_at": time.time(),
+        "title": (title or "")[:60],
+    }
+
+
+def manus_get_session(user_id: int) -> Optional[dict]:
+    sess = _MANUS_SESSIONS.get(user_id)
+    if not sess or not sess.get("task_id"):
+        return None
+    age = time.time() - float(sess.get("updated_at") or 0)
+    if age > MANUS_FOLLOWUP_TTL_SEC:
+        _MANUS_SESSIONS.pop(user_id, None)
+        return None
+    return sess
+
+
+def manus_clear_session(user_id: int):
+    _MANUS_SESSIONS.pop(user_id, None)
+
+
+def manus_session_label(user_id: int) -> str:
+    sess = manus_get_session(user_id)
+    if not sess:
+        return "—"
+    return f"`{str(sess.get('task_id'))[:10]}…`"
+
+
+def manus_send_task_message(
+    api_key: str,
+    task_id: str,
+    prompt: str,
+    attachments: Optional[List[dict]] = None,
+) -> dict:
+    """Continue an existing Manus task (multi-turn). POST /v2/task.sendMessage"""
+    text = (prompt or "").strip()[:4800]
+    if not text:
+        text = (
+            "Continue editing based on the previous result. "
+            "Apply the requested change and briefly describe it."
+        )
+    content_parts: List[dict] = [{"type": "text", "text": text}]
+    if attachments:
+        for att in attachments:
+            if att and att.get("file_data"):
+                content_parts.append(att)
+    payload = {
+        "task_id": task_id,
+        "message": {"content": content_parts},
+    }
+    if MANUS_LOCALE:
+        payload["locale"] = MANUS_LOCALE
+    with httpx.Client(timeout=60.0) as client:
+        res = client.post(
+            f"{MANUS_BASE_URL}/v2/task.sendMessage",
+            headers=manus_headers(api_key),
+            json=payload,
+        )
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
+    if res.status_code >= 400 or (isinstance(data, dict) and data.get("ok") is False):
+        err = (data or {}).get("error") or {}
+        raise RuntimeError(
+            f"Manus task.sendMessage {res.status_code}: {err.get('code') or ''} "
+            f"{err.get('message') or res.text[:200]}"
+        )
+    return {"task_id": task_id, "raw": data}
+
+
+def _manus_try_start_locked(job: dict) -> bool:
+    """Call with lock held. Returns True if job started now."""
+    global _MANUS_ACTIVE
+    if _MANUS_ACTIVE >= MANUS_MAX_CONCURRENT:
+        return False
+    _MANUS_ACTIVE += 1
+    _MANUS_RUNNING_USERS.add(job["user_id"])
+    thread = threading.Thread(
+        target=_manus_job_runner,
+        args=(job,),
+        daemon=True,
+        name=f"manus-{job['user_id']}",
+    )
+    thread.start()
+    return True
+
+
+def _manus_pop_next_locked() -> Optional[dict]:
+    """Call with lock held. Start next queued job if capacity allows."""
+    global _MANUS_ACTIVE
+    if _MANUS_ACTIVE >= MANUS_MAX_CONCURRENT:
+        return None
+    if not _MANUS_QUEUE:
+        return None
+    job = _MANUS_QUEUE.popleft()
+    _MANUS_QUEUED_USERS.discard(job["user_id"])
+    _MANUS_ACTIVE += 1
+    _MANUS_RUNNING_USERS.add(job["user_id"])
+    thread = threading.Thread(
+        target=_manus_job_runner,
+        args=(job,),
+        daemon=True,
+        name=f"manus-{job['user_id']}",
+    )
+    thread.start()
+    return job
+
+
+def _manus_job_runner(job: dict):
+    global _MANUS_ACTIVE
+    user_id = job["user_id"]
+    chat_id = job["chat_id"]
+    try:
+        try:
+            bot.send_message(
+                chat_id,
+                "🟢 **نوبت شما شد** — Manus Agent در حال اجرا…",
+            )
+        except Exception:
+            pass
+        _execute_manus_job(job)
+    except Exception as e:
+        logging.exception(f"manus job runner error: {e}")
+        try:
+            bot.send_message(chat_id, f"❌ خطای داخلی در صف Manus:\n`{str(e)[:200]}`")
+        except Exception:
+            pass
+    finally:
+        with _MANUS_LOCK:
+            _MANUS_ACTIVE = max(0, _MANUS_ACTIVE - 1)
+            _MANUS_RUNNING_USERS.discard(user_id)
+            # promote next waiting job
+            _manus_pop_next_locked()
+
+
+def submit_manus_job(
+    message,
+    prompt: str,
+    user_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    attachments: Optional[List[dict]] = None,
+    followup: bool = False,
+) -> bool:
+    """
+    Enqueue Manus work.
+    followup=True → continue last task (same conversation) via task.sendMessage.
+    followup=False → task.create (new Manus chat).
+    """
+    if user_id is None:
+        user_id = message.from_user.id if message is not None else None
+    if chat_id is None:
+        chat_id = message.chat.id if message is not None else user_id
+    if user_id is None or chat_id is None:
+        logging.error("submit_manus_job: missing user/chat")
+        return False
+
+    session = manus_get_session(user_id)
+    mode = "create"
+    task_id = None
+    task_url = None
+    if followup:
+        if not session:
+            try:
+                bot.send_message(
+                    chat_id,
+                    "ℹ️ گفتگوی فعال Manus پیدا نشد (منقضی یا جدید).\n"
+                    "از `/manus` → **اجرای تسک جدید** شروع کنید.",
+                )
+            except Exception:
+                pass
+            return False
+        mode = "followup"
+        task_id = session.get("task_id")
+        task_url = session.get("task_url")
+    else:
+        manus_clear_session(user_id)
+
+    job = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "prompt": prompt,
+        "attachments": attachments,
+        "queued_at": time.time(),
+        "source_message": message,
+        "mode": mode,
+        "task_id": task_id,
+        "task_url": task_url,
+    }
+
+    mode_fa = "ادامه همین گفتگوی Manus" if mode == "followup" else "گفتگوی جدید Manus"
+
+    with _MANUS_LOCK:
+        if user_id in _MANUS_RUNNING_USERS or user_id in _MANUS_QUEUED_USERS:
+            stats = manus_queue_stats()
+            try:
+                bot.send_message(
+                    chat_id,
+                    "⏳ درخواست قبلی Manus هنوز در حال اجرا یا در صف است.\n"
+                    f"{stats['active']}/{stats['max_concurrent']} اجرا · "
+                    f"{stats['queued']} در صف\n"
+                    "لطفاً تا پایان صبر کنید.",
+                )
+            except Exception:
+                pass
+            return False
+
+        if len(_MANUS_QUEUE) >= MANUS_QUEUE_MAX:
+            try:
+                bot.send_message(
+                    chat_id,
+                    f"🚫 صف Manus پر است (`{len(_MANUS_QUEUE)}/{MANUS_QUEUE_MAX}`).\n"
+                    "چند دقیقه دیگر دوباره تلاش کنید.",
+                )
+            except Exception:
+                pass
+            return False
+
+        if _MANUS_ACTIVE < MANUS_MAX_CONCURRENT:
+            _MANUS_ACTIVE += 1
+            _MANUS_RUNNING_USERS.add(user_id)
+            threading.Thread(
+                target=_manus_job_runner,
+                args=(job,),
+                daemon=True,
+                name=f"manus-{user_id}",
+            ).start()
+            return True
+
+        _MANUS_QUEUE.append(job)
+        _MANUS_QUEUED_USERS.add(user_id)
+        position = len(_MANUS_QUEUE)
+        active = _MANUS_ACTIVE
+        try:
+            bot.send_message(
+                chat_id,
+                f"📥 **درخواست Manus در صف** ({mode_fa})\n\n"
+                f"نوبت شما: **{position}**\n"
+                f"در حال اجرا: `{active}/{MANUS_MAX_CONCURRENT}`\n"
+                f"ظرفیت صف: `{position}/{MANUS_QUEUE_MAX}`\n\n"
+                "به‌محض آزاد شدن نوبت، اجرا می‌شود.\n"
+                "دلیل صف: محدودیت RAM سرور رایگان.",
+            )
+        except Exception:
+            pass
+        return True
 
 
 def run_manus_for_user(
@@ -1343,15 +2138,27 @@ def run_manus_for_user(
     user_id: Optional[int] = None,
     chat_id: Optional[int] = None,
     attachments: Optional[List[dict]] = None,
+    followup: bool = False,
 ):
-    """End-to-end Manus agent run for a Telegram user."""
-    if user_id is None:
-        user_id = message.from_user.id if message is not None else None
-    if chat_id is None:
-        chat_id = message.chat.id if message is not None else user_id
-    if user_id is None or chat_id is None:
-        logging.error("run_manus_for_user: missing user/chat id")
-        return
+    """Public entry — queue + create or follow-up."""
+    return submit_manus_job(
+        message,
+        prompt,
+        user_id=user_id,
+        chat_id=chat_id,
+        attachments=attachments,
+        followup=followup,
+    )
+
+
+def _execute_manus_job(job: dict):
+    """End-to-end Manus agent run (already scheduled by the queue)."""
+    user_id = job["user_id"]
+    chat_id = job["chat_id"]
+    prompt = job.get("prompt") or ""
+    attachments = job.get("attachments")
+    mode = job.get("mode") or "create"
+    existing_task_id = job.get("task_id")
     api_key = get_manus_key(user_id)
     if not api_key:
         markup = InlineKeyboardMarkup()
@@ -1370,65 +2177,125 @@ def run_manus_for_user(
 
     has_media = bool(attachments)
     media_note = " + پیوست عکس/فایل" if has_media else ""
-    status_msg = bot.send_message(
-        chat_id,
-        "🎨 **Manus Agent** در حال اجرا…\n"
-        f"پرامپت: `{prompt[:80]}`{media_note}\n"
-        f"profile: `{MANUS_DEFAULT_PROFILE}` · timeout: `{MANUS_TIMEOUT_SEC}s`\n"
-        "ممکن است چند دقیقه طول بکشد.",
-    )
-
-    try:
-        created = manus_create_task(api_key, prompt, attachments=attachments)
-    except Exception as e:
-        logging.error(f"manus create failed: {e}")
-        err_s = str(e)
-        hint = ""
-        if "401" in err_s or "unauthenticated" in err_s:
-            hint = "\nکلید نامعتبر است — از «کلیدهای من» اصلاح کنید."
-        elif "rate_limited" in err_s or "429" in err_s:
-            hint = "\nRate limit — چند لحظه صبر کنید (حدود ۱۰ task/دقیقه)."
-        elif "credit" in err_s.lower():
-            hint = "\nسهمیه credits کافی نیست."
-        elif "invalid_argument" in err_s:
-            hint = "\nورودی نامعتبر — پرامپت/فایل را ساده‌تر کنید."
-        bot.edit_message_text(
-            f"❌ خطا در ساخت Manus task.\n`{err_s[:300]}`{hint}",
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id,
-            parse_mode="Markdown",
+    if mode == "followup" and existing_task_id:
+        head = (
+            "✏️ **Manus — ادیت/ادامه در همان گفتگو**\n"
+            f"Task: `{str(existing_task_id)[:14]}…`{media_note}\n"
+            f"پرامپت: `{prompt[:80]}`\n"
+            f"timeout: `{MANUS_TIMEOUT_SEC}s`"
         )
-        return
+    else:
+        head = (
+            "🎨 **Manus Agent — گفتگوی جدید**\n"
+            f"پرامپت: `{prompt[:80]}`{media_note}\n"
+            f"profile: `{MANUS_DEFAULT_PROFILE}` · timeout: `{MANUS_TIMEOUT_SEC}s`\n"
+            "ممکن است چند دقیقه طول بکشد.\n"
+            "در پایان: **متن + عکس preview + فایل باکیفیت** + امکان **ادامه ادیت**."
+        )
+    status_msg = bot.send_message(chat_id, head)
 
-    task_id = created.get("task_id")
-    task_url = created.get("task_url") or (
-        f"https://manus.im/app/{task_id}" if task_id else None
-    )
+    created = None
+    if mode == "followup" and existing_task_id:
+        try:
+            manus_send_task_message(api_key, existing_task_id, prompt, attachments=attachments)
+            task_id = existing_task_id
+            task_url = job.get("task_url") or f"https://manus.im/app/{task_id}"
+        except Exception as e:
+            logging.error(f"manus followup failed: {e}")
+            err_s = str(e)
+            hint = ""
+            if "401" in err_s or "unauthenticated" in err_s:
+                hint = "\nکلید نامعتبر است."
+            elif "rate_limited" in err_s or "429" in err_s:
+                hint = "\nRate limit — چند لحظه صبر کنید."
+            elif "credit" in err_s.lower():
+                hint = "\ncredits کافی نیست."
+            elif "not_found" in err_s or "404" in err_s:
+                hint = "\nTask قبلی پیدا نشد — تسک جدید بسازید (`/manus`)."
+                manus_clear_session(user_id)
+            bot.edit_message_text(
+                f"❌ خطا در ادامه گفتگوی Manus.\n`{err_s[:300]}`{hint}",
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
+            # fallback: start new if task vanished
+            if "not_found" in err_s or "404" in err_s:
+                try:
+                    created = manus_create_task(api_key, prompt, attachments=attachments)
+                    mode = "create"
+                    task_id = created.get("task_id")
+                    task_url = created.get("task_url") or f"https://manus.im/app/{task_id}"
+                    if not task_id:
+                        return
+                    bot.send_message(chat_id, "🔄 تسک قبلی نبود — گفتگوی **جدید** Manus ساخته شد.")
+                except Exception as e2:
+                    logging.error(f"manus fallback create: {e2}")
+                    return
+            else:
+                return
+    else:
+        try:
+            created = manus_create_task(api_key, prompt, attachments=attachments)
+        except Exception as e:
+            logging.error(f"manus create failed: {e}")
+            err_s = str(e)
+            hint = ""
+            if "401" in err_s or "unauthenticated" in err_s:
+                hint = "\nکلید نامعتبر است — از «کلیدهای من» اصلاح کنید."
+            elif "rate_limited" in err_s or "429" in err_s:
+                hint = "\nRate limit — چند لحظه صبر کنید (حدود ۱۰ task/دقیقه)."
+            elif "credit" in err_s.lower():
+                hint = "\nسهمیه credits کافی نیست."
+            elif "invalid_argument" in err_s:
+                hint = "\nورودی نامعتبر — پرامپت/فایل را ساده‌تر کنید."
+            bot.edit_message_text(
+                f"❌ خطا در ساخت Manus task.\n`{err_s[:300]}`{hint}",
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
+            return
+
+        task_id = created.get("task_id")
+        task_url = created.get("task_url") or (
+            f"https://manus.im/app/{task_id}" if task_id else None
+        )
+        if not task_id:
+            bot.edit_message_text(
+                f"❌ task_id دریافت نشد.\n`{str(created)[:200]}`",
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id,
+                parse_mode="Markdown",
+            )
+            return
+
     if not task_id:
-        bot.edit_message_text(
-            f"❌ task_id دریافت نشد.\n`{str(created)[:200]}`",
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id,
-            parse_mode="Markdown",
-        )
         return
+
+    # Remember this task for follow-up edits
+    manus_save_session(user_id, task_id, task_url, title=prompt[:60])
 
     try:
         active = get_active_conversation(user_id, get_user_model(user_id))
+        tag = "[manus:edit]" if mode == "followup" else "[manus]"
         save_message(
             active.get("id", ""),
             "user",
-            f"[manus{'+media' if has_media else ''}] {prompt}",
+            f"{tag}{'+media' if has_media else ''} {prompt}",
         )
     except Exception:
         pass
 
     def on_progress(state):
         st = state.get("agent_status") or "running"
-        preview = (state.get("text") or "")[:120]
+        nfiles = len(state.get("files") or [])
+        preview = (state.get("text") or "")[:100]
+        files_note = f"\nفایل‌های پیدا شده: {nfiles}" if nfiles else ""
+        mode_note = "ادیت" if mode == "followup" else "جدید"
         try:
             bot.edit_message_text(
-                f"🎨 Manus `{st}`…\nTask: `{task_id}`\n{preview}",
+                f"🎨 Manus ({mode_note}) `{st}`…\nTask: `{task_id}`\n{preview}{files_note}",
                 chat_id=status_msg.chat.id,
                 message_id=status_msg.message_id,
                 parse_mode="Markdown",
@@ -1437,7 +2304,40 @@ def run_manus_for_user(
             pass
 
     result = manus_wait_for_task(api_key, task_id, on_progress=on_progress)
-    manus_deliver_result(chat_id, status_msg, result, task_url)
+    manus_deliver_result(
+        chat_id,
+        status_msg,
+        result,
+        task_url,
+        api_key=api_key,
+        task_id=task_id,
+    )
+
+    # Stay in follow-up mode so the next photo/text continues this task
+    if result.get("agent_status") not in ("error",):
+        PENDING[user_id] = {
+            "action": "manus_followup",
+            "task_id": task_id,
+            "task_url": task_url or "",
+        }
+        try:
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("✏️ ادیت بعدی (همین گفتگو)", callback_data="manus_followup_hint"))
+            markup.row(InlineKeyboardButton("🆕 گفتگوی جدید Manus", callback_data="manus_run"))
+            markup.row(InlineKeyboardButton("⛔️ پایان حالت ادیت", callback_data="manus_end_followup"))
+            bot.send_message(
+                chat_id,
+                f"🔗 **ادامه در همان گفتگوی Manus**\n"
+                f"Task: `{str(task_id)[:14]}…`\n\n"
+                "برای ادیت بعدی:\n"
+                "• **عکس جدید + کپشن** بفرستید، یا\n"
+                "• فقط **متن دستور** (مثلاً «پس‌زمینه را آبی کن»)\n\n"
+                "این پیام‌ها روی **همین task** می‌روند، نه چت جدید.\n"
+                f"مهلت: `{MANUS_FOLLOWUP_TTL_SEC//60}` دقیقه · `/cancel` برای خروج",
+                reply_markup=markup,
+            )
+        except Exception:
+            pass
 
     if result.get("text") or result.get("files"):
         try:
@@ -1615,6 +2515,7 @@ def get_manus_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.row(InlineKeyboardButton("🚀 اجرای تسک جدید", callback_data="manus_run"))
     markup.row(InlineKeyboardButton("🖼 مثال: ساخت تصویر", callback_data="manus_example_image"))
+    markup.row(InlineKeyboardButton("📊 وضعیت صف", callback_data="manus_queue"))
     markup.row(InlineKeyboardButton("🔑 کلید Manus", callback_data="keys_provider:manus"))
     markup.row(InlineKeyboardButton("💳 credits من", callback_data="manus_credits"))
     markup.row(InlineKeyboardButton("🔙 منوی اصلی", callback_data="menu_main"))
@@ -1647,8 +2548,16 @@ def manus_intro_text(user_id: int) -> str:
         "**ویرایش عکس:**\n"
         "بعد از «اجرای تسک جدید» → **عکس + کپشن** بفرستید\n"
         "(کپشن = دستور ویرایش)\n\n"
-        "⚠️ محدودیت API: حدود **۱۰ task/دقیقه** + سهمیه credits.\n"
-        "چت معمولی همچنان از Dahl/Groq/… استفاده می‌شود."
+        "**ادامه ادیت در همان گفتگو:**\n"
+        "پس از هر نتیجه، عکس/متن بعدی را بفرستید — روی **همین task** می‌رود "
+        "(`task.sendMessage`)، نه چت جدید.\n"
+        "«🆕 گفتگوی جدید» فقط وقتی لازم است که موضوع عوض شود.\n\n"
+        f"**صف همزمانی:** حداکثر **{MANUS_MAX_CONCURRENT}** اجرای همزمان؛ "
+        f"بقیه در صف تا **{MANUS_QUEUE_MAX}** نفر.\n"
+        "دلیل: محدودیت RAM سرور رایگان (جلوگیری از شات‌داون).\n"
+        "هر کاربر فقط **۱** درخواست فعال/در صف.\n\n"
+        "⚠️ محدودیت API Manus: ~۱۰ task/دقیقه به‌ازای هر کلید + credits.\n"
+        "چت معمولی از Dahl/Groq/… استفاده می‌شود."
     )
 
 
@@ -1765,7 +2674,8 @@ def chats_overview_text(chats: List[dict], active_id: Optional[str]) -> str:
         lines.append(f"{mark} `{i}` **{title}**")
         lines.append(f"   `{provider}` / `{mid[:40]}` · `{cid[:8]}…`")
     lines.append("")
-    lines.append("روی هر گفتگو بزنید تا فعال شود؛ بعد پیام بدهید.")
+    lines.append("🗄 فقط **گفتگوی فعلی** روی سرور نگه داشته می‌شود.")
+    lines.append("با «گفتگوی جدید»، قبلی از دیتابیس پاک می‌شود (نه از تلگرام).")
     return "\n".join(lines)
 
 
@@ -1774,35 +2684,37 @@ def usage_text_for_user(user_id: int) -> str:
     model_ref = settings["selected_model"]
     provider, model_id = parse_model_ref(model_ref)
     keys = list_user_keys(user_id)
-    stats = get_usage_stats(user_id)
     q = quota_status(user_id)
     source = "shared"
     if provider in keys:
         source = "user"
-    if stats["error"]:
-        return "خطا در دریافت آمار مصرف."
-    model_lines = ""
-    if stats["by_model"]:
-        model_lines = "\n**تفکیک مصرف:**\n"
-        for mid, tot in sorted(stats["by_model"].items(), key=lambda x: -x[1])[:8]:
-            model_lines += f"• `{mid}`: `{tot:,}`\n"
+    stats = {"total_tokens": q.get("lifetime_used") or 0, "error": False, "by_model": {}, "calls": 0,
+             "input_tokens": 0, "output_tokens": 0}
+    if not SKIP_USAGE_TABLE:
+        live = get_usage_stats(user_id)
+        if not live.get("error"):
+            stats = live
+            # lifetime counter is authoritative when usage table is pruned
+            if q.get("ok"):
+                stats["total_tokens"] = max(stats["total_tokens"], q.get("lifetime_used") or 0)
     applies = (
-        "روی کلید شخصی هم اعمال می‌شود"
+        "سهمیه روزانه نیز روی کلید شخصی اعمال می‌شود"
         if QUOTA_APPLIES_TO_OWN_KEYS
-        else "فقط برای کلید مشترک ربات"
+        else "سهمیه روزانه فقط برای کلید مشترک ربات — **سهمیه کلی برای همه**"
     )
-    quota_note = format_quota_block(q, applies + "\n")
+    quota_note = format_quota_block(q, applies)
+    storage_note = (
+        "🗄 سیاست ذخیره‌سازی: فقط **گفتگوی فعلی** روی سرور می‌ماند؛ "
+        "با چت جدید، تاریخچه قبلی از دیتابیس پاک می‌شود (چت تلگرام شما دست‌نخورده می‌ماند)."
+    )
     return (
         "📊 **گزارش مصرف توکن**\n\n"
-        f"کل مصرف ثبت‌شده: `{stats['total_tokens']:,}`\n"
-        f"• ورودی: `{stats['input_tokens']:,}`\n"
-        f"• خروجی: `{stats['output_tokens']:,}`\n"
-        f"• درخواست‌ها: `{stats['calls']:,}`\n\n"
-        f"**سهمیه روزانه**\n{quota_note}\n"
+        f"{quota_note}\n"
         f"🤖 مدل: `{provider}` / `{model_id}`\n"
         f"🔐 منبع کلید فعلی: `{source}`\n"
         f"⚡ استریم: `{'روشن' if STREAMING_ENABLED else '—'}`\n"
-        f"{model_lines}"
+        f"💾 نگهداری پیام در گفتگوی فعال: آخرین `{KEEP_MESSAGES_IN_ACTIVE_CHAT}` پیام\n\n"
+        f"{storage_note}"
     )
 
 
@@ -1867,18 +2779,37 @@ def admin_stats_text() -> str:
         msg_count_note = "—"
 
     model_lines = "\n".join(f"• `{m}`: `{t:,}`" for m, t in top_models) or "—"
+    if SKIP_USAGE_TABLE and not top_models:
+        model_lines = "(usage table disabled — see user_quotas)"
+
+    # Lifetime totals from quotas (always available)
+    try:
+        qres = sb_get("user_quotas?select=user_id,lifetime_used,lifetime_limit,used_today")
+        qrows = qres.json() or []
+        life_used = sum(int(r.get("lifetime_used") or 0) for r in qrows if isinstance(r, dict))
+        life_lim = sum(int(r.get("lifetime_limit") or 0) for r in qrows if isinstance(r, dict))
+        today_q = sum(int(r.get("used_today") or 0) for r in qrows if isinstance(r, dict))
+        quota_users = len(qrows) if isinstance(qrows, list) else 0
+    except Exception:
+        life_used = life_lim = today_q = quota_users = 0
 
     return (
         "🛡 **آمار ادمین**\n\n"
         f"کاربران کل: `{total_users}`\n"
         f"فعال امروز: `{active_today}`\n"
-        f"گفتگوها: `{total_chats}`\n"
-        f"کل توکن مصرفی: `{total_tokens:,}`\n"
-        f"توکن امروز: `{today_tokens:,}`\n\n"
-        f"**مدل‌های پرتکرار (توکن):**\n{model_lines}\n\n"
-        f"**کلیدهای BYOK ثبت‌شده:** {key_line}\n"
-        f"سهمیه پیش‌فرض روزانه: `{DEFAULT_DAILY_TOKEN_QUOTA:,}`\n"
-        f"اعمال سهمیه روی کلید شخصی: `{'بله' if QUOTA_APPLIES_TO_OWN_KEYS else 'خیر'}`\n"
+        f"گفتگوها (فقط فعلی‌ها): `{total_chats}`\n"
+        f"کاربران با ردیف سهمیه: `{quota_users}`\n\n"
+        f"**سهمیه‌ها (user_quotas)**\n"
+        f"مصرف کلی همه: `{life_used:,}`\n"
+        f"سقف کلی همه: `{life_lim:,}`\n"
+        f"مصرف امروز (شمارنده): `{today_q:,}`\n"
+        f"پیش‌فرض روزانه: `{DEFAULT_DAILY_TOKEN_QUOTA:,}`\n"
+        f"پیش‌فرض مادام‌العمر: `{DEFAULT_LIFETIME_TOKEN_QUOTA:,}`\n"
+        f"هشدار از: `{LIFETIME_WARN_PCT:.0f}%`\n\n"
+        f"**لاگ usage:** `{'خاموش' if SKIP_USAGE_TABLE else 'روشن'}`\n"
+        f"**مدل‌های پرتکرار:**\n{model_lines}\n\n"
+        f"**کلیدهای BYOK:** {key_line}\n"
+        f"سهمیه روزانه روی کلید شخصی: `{'بله' if QUOTA_APPLIES_TO_OWN_KEYS else 'خیر'}`\n"
         f"استریم: `{'روشن' if STREAMING_ENABLED else 'خاموش'}`\n"
         f"کلید مشترک Dahl: `{'ست‌شده' if DAHL_API_KEY else '—'}`"
     )
@@ -2000,7 +2931,8 @@ def handle_clear(message):
             f"🧹 گفتگوی جدید ساخته و فعال شد.\n"
             f"شناسه: `{str(conv.get('id',''))[:8]}…`\n"
             f"مدل: `{provider}` / `{model_id}`\n\n"
-            "رکوردهای قبلی در دیتابیس می‌مانند.",
+            "🗄 **سیاست ذخیره:** فقط همین گفتگو روی سرور می‌ماند.\n"
+            "گفتگوهای قبلی از دیتابیس پاک شدند؛ چت‌های تلگرام شما دست‌نخورده است.",
         )
     except Exception as e:
         logging.error(f"clear error: {e}")
@@ -2032,6 +2964,15 @@ def handle_manus_cmd(message):
     bot.reply_to(message, manus_intro_text(user_id), reply_markup=get_manus_keyboard())
 
 
+@bot.message_handler(commands=["manusqueue", "queue"])
+def handle_manus_queue_cmd(message):
+    info = manus_queue_status_text()
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="manus_queue"))
+    markup.row(InlineKeyboardButton("🎨 Manus", callback_data="menu_manus"))
+    bot.reply_to(message, info["text"], reply_markup=markup)
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -2056,15 +2997,49 @@ def handle_callbacks(call):
         return
 
     if data == "manus_run":
+        manus_clear_session(user_id)
         PENDING[user_id] = {"action": "manus_prompt"}
         answer()
         bot.send_message(
             call.message.chat.id,
-            "🎨 پرامپت **Manus** را بفرستید:\n"
-            "• **فقط متن:** مثلاً `Generate an image of a cat astronaut`\n"
-            "• **عکس + کپشن:** عکس را attach کنید و دستور ویرایش را در کپشن بنویسید\n"
-            "• فایل PDF/عکس به‌همراه متن هم قبول است\n"
+            "🆕 **گفتگوی جدید Manus**\n\n"
+            "پرامپت را بفرستید:\n"
+            "• **فقط متن:** `Generate an image of a cat astronaut`\n"
+            "• **عکس + کپشن:** برای ویرایش عکس\n\n"
+            "اگر می‌خواهید روی **همان نتیجه قبلی** ادیت کنید، این دکمه را نزنید — "
+            "کافی است عکس/متن بعدی را بفرستید (حالت ادیت پس از هر نتیجه فعال می‌ماند).\n"
             "لغو: `/cancel`",
+        )
+        return
+
+    if data == "manus_followup_hint":
+        answer()
+        sess = manus_get_session(user_id)
+        if not sess:
+            bot.send_message(call.message.chat.id, "گفتگوی فعال Manus نیست — `/manus` جدید بزنید.")
+            return
+        PENDING[user_id] = {
+            "action": "manus_followup",
+            "task_id": sess.get("task_id"),
+            "task_url": sess.get("task_url") or "",
+        }
+        bot.send_message(
+            call.message.chat.id,
+            "✏️ حالت **ادیت در همان گفتگو** فعال است.\n"
+            f"Task: `{str(sess.get('task_id'))[:14]}…`\n\n"
+            "عکس + کپشن یا فقط متن دستور بفرستید.",
+        )
+        return
+
+    if data == "manus_end_followup":
+        manus_clear_session(user_id)
+        PENDING.pop(user_id, None)
+        answer("حالت ادیت Manus بسته شد", True)
+        bot.edit_message_text(
+            "⛔️ حالت ادیت Manus پایان یافت.\nبرای شروع: `/manus`",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=get_manus_keyboard(),
         )
         return
 
@@ -2078,6 +3053,21 @@ def handle_callbacks(call):
             ),
             user_id=user_id,
             chat_id=call.message.chat.id,
+        )
+        return
+
+    if data == "manus_queue":
+        info = manus_queue_status_text()
+        markup = InlineKeyboardMarkup()
+        markup.row(InlineKeyboardButton("🔄 بروزرسانی", callback_data="manus_queue"))
+        markup.row(InlineKeyboardButton("🔙 Manus", callback_data="menu_manus"))
+        answer()
+        bot.edit_message_text(
+            info["text"],
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown",
         )
         return
 
@@ -2518,32 +3508,67 @@ def handle_callbacks(call):
 
 @bot.message_handler(commands=["cancel"])
 def handle_cancel(message):
-    PENDING.pop(message.from_user.id, None)
-    bot.reply_to(message, "عملیات لغو شد.")
+    user_id = message.from_user.id
+    PENDING.pop(user_id, None)
+    # keep manus session unless user ends follow-up explicitly
+    bot.reply_to(
+        message,
+        "عملیات لغو شد.\n"
+        "اگر می‌خواهید حالت ادیت Manus هم بسته شود: دکمه «⛔️ پایان حالت ادیت» یا دوباره `/cancel` بعد از نتیجه.",
+    )
 
 
 @bot.message_handler(content_types=["photo", "document"], func=lambda m: True)
 def handle_manus_media(message):
-    """Photo/document support for Manus agent mode."""
+    """Photo/document for Manus: new task or follow-up on same task."""
     user_id = message.from_user.id
-    pending = PENDING.get(user_id)
+    pending = PENDING.get(user_id) or {}
     caption = (message.caption or "").strip()
+    action = pending.get("action")
+    session = manus_get_session(user_id)
 
-    if not pending or pending.get("action") != "manus_prompt":
+    # Follow-up on existing Manus task
+    if action == "manus_followup" or (session and action != "manus_prompt"):
+        ensure_user(message.from_user)
+        status = bot.reply_to(message, "⏬ دریافت فایل برای ادیت در همان گفتگوی Manus…")
+        attachment = extract_media_from_message(message)
+        if not attachment and not caption:
+            bot.edit_message_text(
+                "❌ فایل دریافت نشد و کپشن هم خالی است.",
+                chat_id=status.chat.id,
+                message_id=status.message_id,
+            )
+            return
+        prompt = caption or (
+            "Continue from the previous result. Apply a sensible refinement "
+            "and briefly describe the change."
+        )
+        run_manus_for_user(
+            message,
+            prompt,
+            user_id=user_id,
+            chat_id=message.chat.id,
+            attachments=[attachment] if attachment else None,
+            followup=True,
+        )
+        return
+
+    if action != "manus_prompt":
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("🎨 Manus Agent", callback_data="menu_manus"))
         bot.reply_to(
             message,
             "برای ویرایش/تحلیل عکس با **Manus**:\n"
-            "1) `/manus` یا دکمه 🎨\n"
+            "1) `/manus`\n"
             "2) **اجرای تسک جدید**\n"
-            "3) **عکس + کپشن** (دستور ویرایش) را بفرستید\n\n"
-            "اگر الان فقط عکس فرستادی و در حالت Manus نیستی، از `/manus` شروع کن.",
+            "3) **عکس + کپشن**\n\n"
+            "پس از اولین نتیجه، می‌توانید عکس/متن بعدی را بفرستید تا **در همان گفتگو** ادیت شود.",
             reply_markup=markup,
         )
         return
 
     PENDING.pop(user_id, None)
+    manus_clear_session(user_id)
     ensure_user(message.from_user)
 
     status = bot.reply_to(message, "⏬ دریافت فایل و آماده‌سازی برای Manus…")
@@ -2567,6 +3592,7 @@ def handle_manus_media(message):
         user_id=user_id,
         chat_id=message.chat.id,
         attachments=[attachment],
+        followup=False,
     )
 
 
@@ -2579,9 +3605,30 @@ def _handle_pending_input(message) -> bool:
     action = pending.get("action")
     raw = (message.text or "").strip()
 
+    if action == "manus_followup":
+        task_id = pending.get("task_id")
+        prompt = raw
+        if not prompt:
+            bot.reply_to(
+                message,
+                "دستور ادیت خالی است.\n"
+                "متن بنویسید (مثلاً «پس‌زمینه را آبی کن») یا عکس+کپشن بفرستید.",
+            )
+            return True
+        # keep follow-up mode until job finishes (job re-arms it)
+        run_manus_for_user(
+            message,
+            prompt.strip(),
+            user_id=user_id,
+            chat_id=message.chat.id,
+            followup=True,
+        )
+        return True
+
     if action == "manus_prompt":
         prompt = pending.get("preset") or raw
         PENDING.pop(user_id, None)
+        manus_clear_session(user_id)
         if not prompt or not prompt.strip():
             bot.reply_to(
                 message,
@@ -2595,6 +3642,7 @@ def _handle_pending_input(message) -> bool:
             prompt.strip(),
             user_id=user_id,
             chat_id=message.chat.id,
+            followup=False,
         )
         return True
 
@@ -2699,6 +3747,20 @@ def _handle_pending_input(message) -> bool:
     return False
 
 
+def _looks_like_manus_followup(text: str) -> bool:
+    t = (text or "").lower()
+    if not t or len(t) > 800:
+        return False
+    keys = (
+        "ادیت", "ویرایش", "تغییر", "پس‌زمینه", "رنگ", "کیفیت", "حذف", "اضافه",
+        "انجام بده", "بساز", "عکس", "تصویر",
+        "edit", "change", "remove", "background", "color", "quality",
+        "make the", "make it", "enhance", "retouch", "improve", "add ", "replace",
+        "crop", "resize", "blur", "sharpen", "translate the image",
+    )
+    return any(k in t for k in keys)
+
+
 @bot.message_handler(func=lambda msg: msg.content_type == "text", content_types=["text"])
 def handle_chat(message):
     user_id = message.from_user.id
@@ -2706,6 +3768,19 @@ def handle_chat(message):
     if text.startswith("/"):
         return
     if _handle_pending_input(message):
+        return
+
+    # Open Manus session: edit-like text continues the same task
+    sess = manus_get_session(user_id)
+    if sess and _looks_like_manus_followup(text):
+        ensure_user(message.from_user)
+        run_manus_for_user(
+            message,
+            text.strip(),
+            user_id=user_id,
+            chat_id=message.chat.id,
+            followup=True,
+        )
         return
 
     ensure_user(message.from_user)
@@ -2738,11 +3813,15 @@ def handle_chat(message):
     if not allowed:
         markup = InlineKeyboardMarkup()
         markup.row(InlineKeyboardButton("📊 آمار مصرف", callback_data="menu_usage"))
+        if qstat.get("lifetime_exceeded"):
+            head = "⛔️ **سهمیه کلی شما تمام شد.**"
+            tail = "برای ادامه باید سهمیه افزایش یابد (ادمین) یا طرح جدید فعال شود."
+        else:
+            head = "⛔️ **سهمیه روزانه (کلید مشترک) تمام شد.**"
+            tail = "فردا ریست می‌شود. یا کلید شخصی ثبت کنید (`/keys`) تا از سهمیه خودتان استفاده شود."
         bot.reply_to(
             message,
-            f"⛔️ **سهمیه روزانه تمام شد.**\n\n"
-            f"{format_quota_block(qstat)}\n"
-            f"فردا ریست می‌شود. یا کلید شخصی ثبت کنید (`/keys`).",
+            f"{head}\n\n{format_quota_block(qstat)}\n{tail}",
             reply_markup=markup,
         )
         return
@@ -2845,9 +3924,11 @@ def handle_chat(message):
     tt = result["total_tokens"]
 
     log_usage(user_id, model_id, pt, ct, tt, provider=provider)
-    quota_add_usage(user_id, tt)
+    qstat = quota_add_usage(user_id, tt)
     save_message(conversation_id, "user", text, input_tokens=pt, output_tokens=0)
     save_message(conversation_id, "assistant", reply_content, input_tokens=0, output_tokens=ct)
+    # Keep only recent messages of the active chat on the server
+    trim_conversation_messages(conversation_id)
 
     title = None
     if not history:
@@ -2859,6 +3940,9 @@ def handle_chat(message):
         final += f"\n\n—\n`{tt:,}` توکن · استریم"
     else:
         final += f"\n\n—\n`{tt:,}` توکن"
+    warn = quota_warning_text(qstat) if isinstance(qstat, dict) else None
+    if warn:
+        final += f"\n\n{warn}"
     send_bot_reply(status_msg.chat.id, status_msg.message_id, final, style=response_style)
 
 
